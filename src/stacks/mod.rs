@@ -99,6 +99,8 @@ pub struct Ctx<'a> {
     pub tools: Tools,
     /// `--timeout`, else each stack's default.
     pub timeout: Option<Duration>,
+    /// `[js] classic-scripts` of the scanned source's `modern-tara.toml`.
+    pub classic_scripts: &'a [crate::change::Glob],
 }
 
 impl Ctx<'_> {

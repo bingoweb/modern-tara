@@ -96,8 +96,28 @@ fn installed(name: &str) -> Option<PathBuf> {
     path.into_iter().chain([home.join(".local").join("bin"), home.join(".cargo").join("bin")]).map(|d| d.join(&file)).find(|p| p.is_file())
 }
 
+/// Like `scan`, for runs that may fail before a report exists: the exit
+/// code, stdout and stderr as text (no `--quiet`, so stderr has the summary).
+fn scan_raw(dir: &Path, extra: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_modern-tara"))
+        .arg("scan")
+        .arg("--repo")
+        .arg(dir)
+        .args(extra)
+        .env("MODERN_TARA_CACHE", cache_for(dir))
+        .env("MODERN_TARA_HOME", env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("modern-tara");
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
 /// A one-commit Python repository: `pyproject.toml` with `requires` and `app.py`.
 fn python_repo(name: &str, requires: &str, code: &str) -> TempRepo {
+    python_repo_with(name, requires, code, &[])
+}
+
+/// `python_repo` plus `extra` (path, content) files in the same commit.
+fn python_repo_with(name: &str, requires: &str, code: &str, extra: &[(&str, &str)]) -> TempRepo {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("mt-test-{name}-{}-{n}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -105,6 +125,11 @@ fn python_repo(name: &str, requires: &str, code: &str) -> TempRepo {
     let guard = TempRepo(dir.clone());
     fs::write(dir.join("pyproject.toml"), format!("[project]\nname = \"gate\"\nversion = \"0\"\nrequires-python = \"{requires}\"\n")).unwrap();
     fs::write(dir.join("app.py"), code).unwrap();
+    for (path, content) in extra {
+        let target = dir.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, content).unwrap();
+    }
     git(&dir, &["init", "-q", "-b", "main"]);
     git(&dir, &["add", "-A"]);
     git(&dir, &["commit", "-q", "--no-verify", "-m", "one"]);
@@ -685,6 +710,326 @@ fn gate_passes_on_low_confidence_and_needs_newer() {
     }
 }
 
+const OLD_JOIN: &str = "import os\n\nx = os.path.join('a', 'b')\n";
+const JOIN_RULE: &str = "PTH118";
+
+fn waiver_file(extra: &str) -> String {
+    format!("[[waiver]]\nrule = \"{JOIN_RULE}\"\npaths = [\"*.py\"]\nreason = \"legacy paths\"\ncard = \"MT7\"\n{extra}")
+}
+
+/// Whether the python stack of a `--stacks python` run did not run (tool missing).
+fn python_unusable(v: &Value) -> bool {
+    let stack = &v["stacks"][0];
+    let skipped = stack["status"] != "ok";
+    if skipped {
+        eprintln!("python: {}", stack["message"]);
+    }
+    skipped
+}
+
+fn rules_of(list: &Value) -> Vec<String> {
+    list.as_array().unwrap().iter().map(|f| f["rule"].as_str().unwrap().to_string()).collect()
+}
+
+fn warnings_of(v: &Value) -> Vec<String> {
+    v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn waiver_takes_a_finding_out_of_the_count() {
+    let r = python_repo_with("waive", ">=3.12", OLD_JOIN, &[("modern-tara.toml", &waiver_file(""))]);
+    let (code, v) = scan(&r.0, &["--all-lines", "--stacks", "python"]);
+    if python_unusable(&v) {
+        return;
+    }
+    assert_eq!(v["findings"].as_array().unwrap().len(), 0, "{v}");
+    assert_eq!(rules_of(&v["waived"]), vec![JOIN_RULE], "{v}");
+    assert_eq!(v["waived"][0]["waiver"], serde_json::json!({"index": 1, "rule": JOIN_RULE, "reason": "legacy paths", "card": "MT7"}));
+    assert_eq!(v["waived"][0]["file"], "app.py");
+    assert_eq!(code, 0, "{v}");
+    let (gated, _) = scan(&r.0, &["--all-lines", "--stacks", "python", "--gate"]);
+    assert_eq!(gated, 0);
+    assert_eq!(v["waivers"]["file"], "modern-tara.toml");
+    let entry = &v["waivers"]["entries"][0];
+    assert_eq!((entry["matched"].as_u64(), entry["status"].as_str()), (Some(1), Some("active")), "{v}");
+    assert!(warnings_of(&v).is_empty(), "{v}");
+    let (_, _, stderr) = scan_raw(&r.0, &["--all-lines", "--stacks", "python"]);
+    assert!(stderr.contains("modern-tara: 0 findings, 1 waived in "), "{stderr}");
+}
+
+#[test]
+fn expired_waiver_counts_again_with_a_warning() {
+    let r = python_repo_with("expired", ">=3.12", OLD_JOIN, &[("modern-tara.toml", &waiver_file("expires = \"2020-01-01\"\n"))]);
+    let (code, v) = scan(&r.0, &["--all-lines", "--stacks", "python", "--gate"]);
+    if python_unusable(&v) {
+        return;
+    }
+    assert_eq!(rules_of(&v["findings"]), vec![JOIN_RULE], "{v}");
+    assert_eq!(v["waived"].as_array().unwrap().len(), 0);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["waivers"]["entries"][0]["status"], "expired");
+    assert_eq!(v["waivers"]["entries"][0]["expires"], "2020-01-01");
+    assert_eq!(warnings_of(&v), vec![format!("waiver 1 ({JOIN_RULE}) expired on 2020-01-01 (card MT7); its findings count again")]);
+    let (_, _, stderr) = scan_raw(&r.0, &["--all-lines", "--stacks", "python"]);
+    assert!(stderr.contains("modern-tara: warning: waiver 1"), "{stderr}");
+}
+
+#[test]
+fn no_waivers_ignores_the_file_and_waivers_reads_another() {
+    let r = python_repo_with("nowaive", ">=3.12", OLD_JOIN, &[("modern-tara.toml", &waiver_file(""))]);
+    let (code, v) = scan(&r.0, &["--all-lines", "--stacks", "python", "--no-waivers"]);
+    if python_unusable(&v) {
+        return;
+    }
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(rules_of(&v["findings"]), vec![JOIN_RULE]);
+    assert_eq!(v["waived"], serde_json::json!([]));
+    assert!(v["waivers"]["file"].is_null() && v["waivers"]["entries"].as_array().unwrap().is_empty(), "{v}");
+
+    // Another file, outside the repository; the repository file has its own waiver, which is ignored.
+    let bare = python_repo_with("otherfile", ">=3.12", OLD_JOIN, &[("modern-tara.toml", &waiver_file("").replace("legacy paths", "from the repository"))]);
+    let outside = std::env::temp_dir().join(format!("mt-test-waivers-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    fs::create_dir_all(&outside).unwrap();
+    let _guard = TempRepo(outside.clone());
+    let path = outside.join("elsewhere.toml");
+    fs::write(&path, waiver_file("")).unwrap();
+    let path_text = path.to_string_lossy().into_owned();
+    let (code, v) = scan(&bare.0, &["--all-lines", "--stacks", "python", "--waivers", &path_text]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["waivers"]["file"], path_text.as_str());
+    assert_eq!(rules_of(&v["waived"]), vec![JOIN_RULE]);
+    assert_eq!(v["waived"][0]["waiver"]["reason"], "legacy paths", "the --waivers file replaces the repository list");
+
+    let missing = outside.join("missing.toml").to_string_lossy().into_owned();
+    let (code, stdout, stderr) = scan_raw(&bare.0, &["--all-lines", "--stacks", "python", "--waivers", &missing]);
+    assert_eq!(code, 2, "{stdout}{stderr}");
+    assert!(stderr.contains("--waivers") && stdout.is_empty(), "{stderr}");
+    let (code, _, stderr) = scan_raw(&bare.0, &["--all-lines", "--waivers", &missing, "--no-waivers"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("exclude each other"), "{stderr}");
+}
+
+#[test]
+fn waiver_whose_paths_do_not_match_waives_nothing() {
+    let text = waiver_file("").replace("[\"*.py\"]", "[\"lib/*.py\"]");
+    let r = python_repo_with("nomatch", ">=3.12", OLD_JOIN, &[("modern-tara.toml", &text)]);
+    let (code, v) = scan(&r.0, &["--all-lines", "--stacks", "python"]);
+    if python_unusable(&v) {
+        return;
+    }
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(rules_of(&v["findings"]), vec![JOIN_RULE]);
+    assert_eq!(v["waivers"]["entries"][0]["matched"], 0);
+    assert_eq!(warnings_of(&v), vec![format!("waiver 1 ({JOIN_RULE}) matched nothing")], "{v}");
+
+    // A diff scan: an unmatched waiver is normal and says nothing.
+    fs::write(r.0.join("new.py"), OLD_JOIN).unwrap();
+    let (code, v) = scan(&r.0, &["--stacks", "python"]);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["findings"][0]["file"], "new.py");
+    assert!(warnings_of(&v).is_empty(), "{v}");
+}
+
+#[test]
+fn malformed_waiver_file_is_a_tool_error_naming_the_entry() {
+    let text = format!("{}\n[[waiver]]\nrule = \"X\"\npaths = [\"a\"]\nreason = \"r\"\ncolour = \"red\"\n", waiver_file(""));
+    let r = python_repo_with("badwaiver", ">=3.12", OLD_JOIN, &[("modern-tara.toml", &text)]);
+    let (code, stdout, stderr) = scan_raw(&r.0, &["--all-lines", "--stacks", "python"]);
+    assert_eq!(code, 2, "{stdout}{stderr}");
+    assert!(stdout.is_empty(), "no JSON on a tool error: {stdout}");
+    assert!(stderr.contains("modern-tara.toml: waiver 2: unknown key `colour`"), "{stderr}");
+    // The audit switch does not read the file at all.
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "python", "--no-waivers"]);
+    assert!(v["waivers"]["file"].is_null(), "{v}");
+}
+
+#[test]
+fn waiver_is_read_from_the_scanned_revision() {
+    let r = python_repo_with("revwaiver", ">=3.12", "x = 1\n", &[("modern-tara.toml", &waiver_file(""))]);
+    fs::write(r.0.join("more.py"), OLD_JOIN).unwrap();
+    git(&r.0, &["add", "-A"]);
+    git(&r.0, &["commit", "-q", "--no-verify", "-m", "two"]);
+    fs::remove_file(r.0.join("modern-tara.toml")).unwrap();
+
+    let (code, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "python"]);
+    if python_unusable(&v) {
+        return;
+    }
+    assert_eq!(code, 0, "the committed waiver applies to the revision: {v}");
+    assert_eq!(rules_of(&v["waived"]), vec![JOIN_RULE], "{v}");
+    assert_eq!(v["waivers"]["file"], "modern-tara.toml");
+
+    let (code, v) = scan(&r.0, &["--all-lines", "--stacks", "python"]);
+    assert_eq!(code, 1, "the work tree has no waiver file: {v}");
+    assert_eq!(rules_of(&v["findings"]), vec![JOIN_RULE]);
+    assert!(v["waivers"]["file"].is_null());
+}
+
+#[test]
+fn files_globs_with_classes_and_braces() {
+    let extra = [("lib.py", OLD_JOIN), ("zeta.py", OLD_JOIN), ("notes.md", "x\n")];
+    let r = python_repo_with("globs", ">=3.12", OLD_JOIN, &extra);
+    let files_of = |v: &Value| v["stacks"][0]["files"].clone();
+
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "python", "--files", "[a-l]*.py"]);
+    assert_eq!(files_of(&v), serde_json::json!(["app.py", "lib.py"]), "{v}");
+    assert!(v["change"].get("unmatched").is_none());
+    assert_eq!(v["warnings"], serde_json::json!([]));
+
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "python", "--files", "{app,lib}.py"]);
+    assert_eq!(files_of(&v), serde_json::json!(["app.py", "lib.py"]), "{v}");
+
+    // One glob matches, one does not: a warning, and the scan goes on.
+    let (code, v) = scan(&r.0, &["--all-lines", "--stacks", "python", "--files", "a*.py", "*.rs"]);
+    assert_eq!(files_of(&v), serde_json::json!(["app.py"]), "{v}");
+    assert_eq!(v["change"]["unmatched"], serde_json::json!(["*.rs"]));
+    assert_eq!(warnings_of(&v), vec!["--files *.rs matches nothing"]);
+    if !python_unusable(&v) {
+        assert_eq!(code, 1, "{v}");
+    }
+    let (_, _, stderr) = scan_raw(&r.0, &["--all-lines", "--stacks", "python", "--files", "a*.py", "*.rs"]);
+    assert!(stderr.contains("modern-tara: warning: --files *.rs matches nothing"), "{stderr}");
+
+    // Every glob unmatched: a tool error.
+    let (code, stdout, stderr) = scan_raw(&r.0, &["--all-lines", "--stacks", "python", "--files", "*.rs", "[x-z].md"]);
+    assert_eq!(code, 2, "{stdout}{stderr}");
+    assert!(stderr.contains("--files matched nothing: *.rs, [x-z].md"), "{stderr}");
+    // A plain path that does not exist is still its own error.
+    let (code, _, stderr) = scan_raw(&r.0, &["--all-lines", "--files", "gone.py"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("--files gone.py: no such file"), "{stderr}");
+}
+
+/// A repository of plain files, one commit.
+fn plain_repo(name: &str, files: &[(&str, &str)]) -> TempRepo {
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("mt-test-{name}-{}-{n}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let guard = TempRepo(dir.clone());
+    for (path, content) in files {
+        let target = dir.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, content).unwrap();
+    }
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "--no-verify", "-m", "one"]);
+    guard
+}
+
+/// Browser code: a directive, a top-level promise chain, and two constructs
+/// that have nothing to do with modules (`var`, `items[items.length - 1]`).
+const BROWSER_SCRIPT: &str = "'use strict';\n\nfetch('/api/items')\n  .then((response) => response.json())\n  .catch((error) => console.error(error));\n\nvar items = [1, 2, 3];\nvar last = items[items.length - 1];\n";
+const NODE_SCRIPT: &str = "const fs = require('node:fs');\n\nmodule.exports = fs.readFileSync('x', 'utf8');\n";
+
+fn js_files(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+    let mut files = vec![
+        ("package.json", "{\n  \"name\": \"site\",\n  \"private\": true,\n  \"engines\": { \"node\": \">=24\" }\n}\n"),
+        ("public/app.js", BROWSER_SCRIPT),
+        ("server.js", NODE_SCRIPT),
+    ];
+    files.extend_from_slice(extra);
+    files
+}
+
+/// `(rule, line)` of the findings in `file`.
+fn findings_in(v: &Value, file: &str) -> Vec<(String, u64)> {
+    v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["file"] == file)
+        .map(|f| (f["rule"].as_str().unwrap().to_string(), f["line"].as_u64().unwrap()))
+        .collect()
+}
+
+#[test]
+fn classic_scripts_are_not_asked_to_become_modules() {
+    let toml = "[js]\nclassic-scripts = [\"public/**/*.js\"]\n";
+    let rules = |found: &[(String, u64)]| found.iter().map(|(rule, _)| rule.clone()).collect::<Vec<_>>();
+    // Without the table: the module rules do flag the browser script.
+    let plain = plain_repo("classic-off", &js_files(&[]));
+    let (_, v) = scan(&plain.0, &["--all-lines", "--stacks", "js"]);
+    if v["stacks"][0]["status"] != "ok" {
+        eprintln!("js: skipped ({})", v["stacks"][0]["message"]);
+        return;
+    }
+    let before = findings_in(&v, "public/app.js");
+    assert!(before.contains(&("unicorn/prefer-module".to_string(), 1)), "{before:?}");
+    for rule in ["unicorn/prefer-top-level-await", "no-var", "unicorn/prefer-at"] {
+        assert!(rules(&before).iter().any(|r| r == rule), "{rule} in {before:?}");
+    }
+    let files = &v["stacks"][0]["pins"]["files"];
+    assert_eq!((files["public/app.js"]["type"].as_str(), files["public/app.js"]["sourceType"].as_str()), (Some("commonjs"), Some("commonjs")));
+
+    // With it: neither module rule, every other rule still there, the CommonJS server still flagged.
+    let classic = plain_repo("classic-on", &js_files(&[("modern-tara.toml", toml)]));
+    let (_, v) = scan(&classic.0, &["--all-lines", "--stacks", "js"]);
+    let after = findings_in(&v, "public/app.js");
+    let after_rules = rules(&after);
+    for gone in ["unicorn/prefer-module", "unicorn/prefer-top-level-await", "unicorn/prefer-import-meta-properties"] {
+        assert!(!after_rules.iter().any(|r| r == gone), "{gone} in {after:?}");
+    }
+    for stays in ["no-var", "unicorn/prefer-at"] {
+        assert!(after_rules.iter().any(|r| r == stays), "{stays} must stay for a classic script: {after:?}");
+    }
+    assert!(findings_in(&v, "server.js").iter().any(|(rule, _)| rule == "unicorn/prefer-module"), "{v}");
+    let files = &v["stacks"][0]["pins"]["files"];
+    assert_eq!(files["public/app.js"]["sourceType"], "script", "{v}");
+    assert_eq!(files["public/app.js"]["type"], "commonjs", "`type` stays the package kind: {v}");
+    assert_eq!((files["server.js"]["type"].as_str(), files["server.js"]["sourceType"].as_str()), (Some("commonjs"), Some("commonjs")));
+    assert_eq!(v["stacks"][0]["message"], "", "no note without .mjs/.cjs/TS files: {v}");
+    assert_eq!(v["warnings"], serde_json::json!([]), "{v}");
+
+    // `--no-waivers` keeps `[js]`.
+    let (_, v) = scan(&classic.0, &["--all-lines", "--stacks", "js", "--no-waivers"]);
+    assert_eq!(v["stacks"][0]["pins"]["files"]["public/app.js"]["sourceType"], "script", "{v}");
+
+    // An `.mjs` the glob matches is still parsed as a module, and says nothing about it. A `.js` that is
+    // really an ES module is linted as one (all rules) and raises a warning.
+    let es_module = "import x from './mod.mjs';\n\nvar y = x;\nconsole.log(y);\n";
+    let mixed_files = js_files(&[
+        ("modern-tara.toml", "[js]\nclassic-scripts = [\"public/**\"]\n"),
+        ("public/mod.mjs", "export const x = 1;\n"),
+        ("public/bad.js", es_module),
+    ]);
+    let mixed = plain_repo("classic-mixed", &mixed_files);
+    let (_, v) = scan(&mixed.0, &["--all-lines", "--stacks", "js"]);
+    let message = v["stacks"][0]["message"].as_str().unwrap();
+    assert!(message.contains("1 file(s) in classic-scripts keep their own module kind (.mjs/.cjs/TS)"), "{message}");
+    let warnings: Vec<&str> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect();
+    assert_eq!(warnings, vec!["public/bad.js is in classic-scripts but parses only as an ES module"], "the .mjs must not be parsed as a script: {v}");
+    assert!(rules(&findings_in(&v, "public/bad.js")).iter().any(|r| r == "no-var"), "module findings for bad.js: {v}");
+    let files = &v["stacks"][0]["pins"]["files"];
+    assert_eq!(files["public/mod.mjs"]["sourceType"], "module", "{v}");
+    assert_eq!(files["public/bad.js"]["sourceType"], "module", "the kind that finally parsed: {v}");
+    assert_eq!(files["public/app.js"]["sourceType"], "script", "{v}");
+    // The gate sees the findings, and stderr carries the warning.
+    let (code, _, stderr) = scan_raw(&mixed.0, &["--all-lines", "--stacks", "js", "--gate"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("modern-tara: warning: public/bad.js is in classic-scripts but parses only as an ES module"), "{stderr}");
+
+    // The same file without the table is just retried as a module: findings, no warning.
+    let retried = plain_repo("classic-retry", &js_files(&[("public/bad.js", es_module), ("public/mod.mjs", "export const x = 1;\n")]));
+    let (_, v) = scan(&retried.0, &["--all-lines", "--stacks", "js"]);
+    assert!(!v["stacks"][0]["message"].as_str().unwrap().contains("not parsed"), "{v}");
+    assert_eq!(v["warnings"], serde_json::json!([]), "{v}");
+    assert!(rules(&findings_in(&v, "public/bad.js")).iter().any(|r| r == "no-var"), "{v}");
+
+    // Neither a script nor a module: a note, no warning.
+    let garbage = plain_repo("classic-garbage", &js_files(&[("modern-tara.toml", toml), ("public/broken.js", "const = ;\n")]));
+    let (_, v) = scan(&garbage.0, &["--all-lines", "--stacks", "js"]);
+    assert!(v["stacks"][0]["message"].as_str().unwrap().contains("public/broken.js: not parsed as a classic script or as an ES module: "), "{v}");
+    assert_eq!(v["warnings"], serde_json::json!([]), "{v}");
+
+    // A broken `[js]` table is a tool error naming it.
+    let broken = plain_repo("classic-broken", &js_files(&[("modern-tara.toml", "[js]\nclassic-scripts = []\n")]));
+    let (code, stdout, stderr) = scan_raw(&broken.0, &["--all-lines", "--stacks", "js"]);
+    assert_eq!(code, 2, "{stdout}{stderr}");
+    assert!(stderr.contains("modern-tara.toml: [js]: "), "{stderr}");
+}
+
 /// No personal paths or user names in the published files. The licence's
 /// copyright line is the one place a name belongs.
 #[test]
@@ -709,7 +1054,8 @@ fn no_personal_paths_or_user_names() {
                 }
                 continue;
             }
-            if ["LICENSE", "Cargo.lock", "package-lock.json"].contains(&name.as_str()) {
+            // `.git` is a file in a linked worktree (`gitdir: <main clone>/.git/worktrees/...`).
+            if ["LICENSE", "Cargo.lock", "package-lock.json", ".git"].contains(&name.as_str()) {
                 continue;
             }
             let Ok(text) = fs::read_to_string(e.path()) else { continue };

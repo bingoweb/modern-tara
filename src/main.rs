@@ -17,6 +17,7 @@ mod proc;
 mod report;
 mod stacks;
 mod toolset;
+mod waiver;
 
 use change::{Change, Lines, Source};
 use git::Git;
@@ -89,8 +90,11 @@ fn scan(o: &cli::Opts) -> Result<i32, String> {
         return Err(format!("{}: not a folder", dir.display()));
     }
     let change = build_change(o, &dir)?;
+    let config = load_config(o, &change)?;
+    let mut waivers = config.waivers;
     let temp = copy::TempRoot::create()?;
-    let ctx = stacks::Ctx { change: &change, temp: &temp, home: home(), tools: stacks::Tools::find(), timeout: o.timeout };
+    let ctx =
+        stacks::Ctx { change: &change, temp: &temp, home: home(), tools: stacks::Tools::find(), timeout: o.timeout, classic_scripts: &config.classic_scripts };
 
     let selected: Vec<&'static str> = stacks::ALL.iter().copied().filter(|s| o.stacks.as_ref().is_none_or(|l| l.iter().any(|x| x == s))).collect();
     let work: Vec<(&'static str, Vec<String>)> =
@@ -126,9 +130,15 @@ fn scan(o: &cli::Opts) -> Result<i32, String> {
     }
     report::tidy(&mut findings);
     drop(temp);
+    let today = waiver::today_utc();
+    let (findings, waived) = waivers.apply(findings, today);
+    let mut warnings = unmatched_warnings(&change);
+    warnings.extend(reports.iter().flat_map(|r| r.warnings.iter().cloned()));
+    warnings.extend(waivers.warnings(today, o.all_lines));
 
     let repo = change.root.to_string_lossy().replace('\\', "/");
-    let doc = report::document(VERSION, &repo, &change.describe, &reports, &findings);
+    let extras = report::Extras { waived: &waived, waivers: &waivers.to_json(today), warnings: &warnings };
+    let doc = report::document(VERSION, &repo, &change.describe, &reports, &findings, &extras);
     let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     if let Some(path) = &o.json_out {
         std::fs::write(path, format!("{text}\n")).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -141,7 +151,7 @@ fn scan(o: &cli::Opts) -> Result<i32, String> {
     let failed = reports.iter().any(|r| r.status == Status::Error);
     let code = report::exit_code(&findings, failed, o.gate);
     if !o.quiet {
-        eprint!("{}", report::summary(&reports, &findings, total_ms, o.gate.then_some(code)));
+        eprint!("{}", report::summary(&reports, &findings, waived.len(), &warnings, total_ms, o.gate.then_some(code)));
     }
     Ok(code)
 }
@@ -177,10 +187,10 @@ fn build_change(o: &cli::Opts, dir: &Path) -> Result<Change, String> {
             return Err("--range and --staged need a git repository".into());
         }
         let mut change = Change::new(dir.to_path_buf(), Source::Dir, BTreeMap::new(), json!({}));
-        let files = select(&change, &o.files, "", dir)?;
+        let (files, unmatched) = select(&change, &o.files, "", dir)?;
         let count = files.len();
         change.files = files.into_iter().map(|f| (f, Lines::All)).collect();
-        change.describe = json!({"mode": "files", "git": false, "all_lines": true, "files": count});
+        change.describe = with_unmatched(json!({"mode": "files", "git": false, "all_lines": true, "files": count}), &unmatched);
         return Ok(change);
     };
     let exe = git.ok_or("git not found")?;
@@ -200,7 +210,12 @@ fn build_change(o: &cli::Opts, dir: &Path) -> Result<Change, String> {
         (Source::WorkTree(g.clone()), from, None, "worktree")
     };
     let mut change = Change::new(top.clone(), source, BTreeMap::new(), json!({}));
-    let wanted: Option<Vec<String>> = if o.files.is_empty() { None } else { Some(select(&change, &o.files, &prefix, dir)?) };
+    let (wanted, unmatched): (Option<Vec<String>>, Vec<String>) = if o.files.is_empty() {
+        (None, Vec::new())
+    } else {
+        let (files, unmatched) = select(&change, &o.files, &prefix, dir)?;
+        (Some(files), unmatched)
+    };
     let files: BTreeMap<String, Lines> = if o.all_lines {
         let list = match &wanted {
             Some(w) => w.clone(),
@@ -229,25 +244,92 @@ fn build_change(o: &cli::Opts, dir: &Path) -> Result<Change, String> {
         files.retain(|f, _| change::strip_dir(f, &prefix).is_some_and(|rest| !rest.is_empty()));
     }
     let changed_lines: u64 = files.values().filter_map(Lines::count).sum();
-    change.describe = json!({
-        "mode": mode,
-        "from": if mode == "range" || !o.all_lines { Some(base) } else { None },
-        "to": match mode { "range" => target, "staged" => Some("index".into()), _ => Some("worktree".into()) },
-        "all_lines": o.all_lines,
-        "files": files.len(),
-        "changed_lines": if o.all_lines { None } else { Some(changed_lines) },
-        "git_safe": o.git_safe,
-    });
+    change.describe = with_unmatched(
+        json!({
+            "mode": mode,
+            "from": if mode == "range" || !o.all_lines { Some(base) } else { None },
+            "to": match mode { "range" => target, "staged" => Some("index".into()), _ => Some("worktree".into()) },
+            "all_lines": o.all_lines,
+            "files": files.len(),
+            "changed_lines": if o.all_lines { None } else { Some(changed_lines) },
+            "git_safe": o.git_safe,
+        }),
+        &unmatched,
+    );
     change.files = files;
     Ok(change)
 }
 
-/// `--files` patterns resolved against the source's listing (globs) or as
-/// plain paths, relative to the `--repo` folder.
-fn select(change: &Change, patterns: &[String], prefix: &str, dir: &Path) -> Result<Vec<String>, String> {
+/// `describe` plus `"unmatched": [..]` (only when some `--files` glob matched nothing).
+fn with_unmatched(mut describe: serde_json::Value, unmatched: &[String]) -> serde_json::Value {
+    if !unmatched.is_empty()
+        && let Some(map) = describe.as_object_mut()
+    {
+        map.insert("unmatched".into(), json!(unmatched));
+    }
+    describe
+}
+
+/// `modern-tara.toml` as the scanned source holds it: `None` when it is not
+/// there, an error when it is listed but cannot be read (never a silent "no
+/// file").
+fn read_repo_file(change: &Change) -> Result<Option<String>, String> {
+    if !change.exists(waiver::FILE) {
+        return Ok(None);
+    }
+    let cannot = |why: String| format!("{}: cannot read: {why}", waiver::FILE);
+    let mut found = change.read(&[waiver::FILE.to_string()]).map_err(cannot)?;
+    let bytes = found.remove(waiver::FILE).ok_or_else(|| cannot(format!("unreadable or over {} bytes", change::MAX_FILE_BYTES)))?;
+    String::from_utf8(bytes).map(Some).map_err(|_| cannot("not UTF-8".into()))
+}
+
+/// The repository file's two parts. `[js]` always comes from the scanned
+/// source's `modern-tara.toml`. The waivers: `--no-waivers` none (the file's
+/// `[[waiver]]` list is not even read), `--waivers FILE` that file from disk
+/// (the repository's own list is ignored), else the repository file's.
+fn load_config(o: &cli::Opts, change: &Change) -> Result<waiver::RepoFile, String> {
+    let own_waivers = if let Some(path) = &o.waivers {
+        let name = path.display().to_string();
+        let text = std::fs::read_to_string(path).map_err(|e| format!("--waivers {name}: {e}"))?;
+        Some(waiver::Set::load(&name, &text)?)
+    } else {
+        None
+    };
+    let mut config = match read_repo_file(change)? {
+        Some(text) => waiver::RepoFile::load(&text, !o.no_waivers && own_waivers.is_none())?,
+        None => waiver::RepoFile::default(),
+    };
+    if let Some(set) = own_waivers {
+        config.waivers = set;
+    }
+    Ok(config)
+}
+
+/// The warning for each `--files` glob that matched nothing.
+fn unmatched_warnings(change: &Change) -> Vec<String> {
+    let list = change.describe.get("unmatched").and_then(serde_json::Value::as_array);
+    list.into_iter().flatten().filter_map(serde_json::Value::as_str).map(|p| format!("--files {p} matches nothing")).collect()
+}
+
+/// `--files` patterns resolved against the source's listing, relative to the
+/// `--repo` folder (`prefix` below the top level). Per pattern: first the
+/// literal path (so `app/[id]/page.tsx` and a `--repo` folder named `[id]`
+/// are never read as globs), else, when the pattern itself has glob
+/// characters, the glob over the listed files under `prefix`, else an error.
+/// Returns the files and the globs (as given) that matched nothing: those are
+/// warnings, an error only when no pattern matched anything.
+fn select(change: &Change, patterns: &[String], prefix: &str, dir: &Path) -> Result<(Vec<String>, Vec<String>), String> {
     let listing = change.listing()?;
     let dir_text = dir.to_string_lossy();
     let mut out = Vec::new();
+    let mut unmatched = Vec::new();
+    let literal = |n: &str| -> Option<String> {
+        match listing.iter().find(|l| l.eq_ignore_ascii_case(n)) {
+            Some(l) => Some(l.clone()),
+            None if matches!(change.source, Source::WorkTree(_) | Source::Dir) && change.root.join(n).is_file() => Some(n.to_string()),
+            None => None,
+        }
+    };
     for raw in patterns {
         let mut p = raw.replace('\\', "/");
         if Path::new(raw).is_absolute() {
@@ -258,24 +340,33 @@ fn select(change: &Change, patterns: &[String], prefix: &str, dir: &Path) -> Res
         }
         let p = p.trim_start_matches("./");
         let full = if prefix.is_empty() { p.to_string() } else { format!("{prefix}/{p}") };
-        if change::is_glob(&full) {
+        let normalized = change::normalize(&full);
+        if let Some(found) = normalized.as_deref().and_then(literal) {
+            out.push(found);
+        } else if change::is_glob(p) {
+            let glob = change::Glob::new(p).map_err(|e| format!("--files {raw}: {e}"))?;
             let before = out.len();
-            out.extend(listing.iter().filter(|l| change::glob_match(&full, l)).cloned());
+            for entry in listing {
+                let inside = if prefix.is_empty() { Some(entry.clone()) } else { change::strip_dir(entry, prefix) };
+                if inside.is_some_and(|rest| glob.matches(&rest)) {
+                    out.push(entry.clone());
+                }
+            }
             if out.len() == before {
-                return Err(format!("--files {raw}: matches nothing"));
+                unmatched.push(raw.clone());
             }
+        } else if normalized.is_none() {
+            return Err(format!("--files {raw}: outside the repository"));
         } else {
-            let n = change::normalize(&full).ok_or_else(|| format!("--files {raw}: outside the repository"))?;
-            match listing.iter().find(|l| l.eq_ignore_ascii_case(&n)) {
-                Some(l) => out.push(l.clone()),
-                None if matches!(change.source, Source::WorkTree(_) | Source::Dir) && change.root.join(&n).is_file() => out.push(n),
-                None => return Err(format!("--files {raw}: no such file")),
-            }
+            return Err(format!("--files {raw}: no such file"));
         }
+    }
+    if !patterns.is_empty() && unmatched.len() == patterns.len() {
+        return Err(format!("--files matched nothing: {}", unmatched.join(", ")));
     }
     out.sort();
     out.dedup();
-    Ok(out)
+    Ok((out, unmatched))
 }
 
 /// `--version`: this tool and every underlying tool, found or not, then a
@@ -362,4 +453,154 @@ fn versions() -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plain folder with these files, scanned as `Source::Dir`.
+    fn folder(name: &str, files: &[&str]) -> (PathBuf, Change) {
+        let root = std::env::temp_dir().join(format!("mt-select-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for f in files {
+            let path = root.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+        }
+        let change = Change::new(root.clone(), Source::Dir, BTreeMap::new(), json!({}));
+        (root, change)
+    }
+
+    fn pats(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn select_collects_unmatched_globs_and_goes_on() {
+        let (root, change) = folder("some", &["a.py", "b.py", "sub/c.py"]);
+        let (files, unmatched) = select(&change, &pats(&["[a-b].py", "*.rs", "{sub,lib}/*.py", "nope/**"]), "", &root).unwrap();
+        assert_eq!(files, vec!["a.py", "b.py", "sub/c.py"]);
+        assert_eq!(unmatched, vec!["*.rs", "nope/**"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn select_errors_only_when_every_pattern_matches_nothing() {
+        let (root, change) = folder("none", &["a.py"]);
+        let err = select(&change, &pats(&["*.rs", "x/[0-9].py"]), "", &root).unwrap_err();
+        assert_eq!(err, "--files matched nothing: *.rs, x/[0-9].py");
+        // A plain path that is missing stays an error of its own, even next to a match.
+        let err = select(&change, &pats(&["*.py", "missing.py"]), "", &root).unwrap_err();
+        assert_eq!(err, "--files missing.py: no such file");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn select_takes_an_existing_literal_path_before_any_glob() {
+        // `[id]` as a class would match the folder `d`: the literal file wins.
+        let (root, change) = folder("literal", &["app/[id]/page.css", "app/d/page.css", "app/i/other.tsx"]);
+        let (files, unmatched) = select(&change, &pats(&["app/[id]/page.css"]), "", &root).unwrap();
+        assert_eq!(files, vec!["app/[id]/page.css"]);
+        assert_eq!(unmatched, Vec::<String>::new());
+        // No such literal path: the class is a class.
+        let (files, _) = select(&change, &pats(&["app/[id]/*.tsx"]), "", &root).unwrap();
+        assert_eq!(files, vec!["app/i/other.tsx"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn select_does_not_read_the_repo_prefix_as_a_glob() {
+        let (root, change) = folder("prefix", &["app/[id]/page.css", "app/d/page.css", "app/{x,y}/a.css", "app/x/b.css", "app/y/c.css"]);
+        // `--repo app/[id] --files page.css`: only the file inside --repo.
+        let (files, _) = select(&change, &pats(&["page.css"]), "app/[id]", &root).unwrap();
+        assert_eq!(files, vec!["app/[id]/page.css"]);
+        // `--repo "app/{x,y}" --files "*.css"`: the glob runs below the folder, not on `prefix/*.css`.
+        let (files, unmatched) = select(&change, &pats(&["*.css"]), "app/{x,y}", &root).unwrap();
+        assert_eq!(files, vec!["app/{x,y}/a.css"]);
+        assert_eq!(unmatched, Vec::<String>::new());
+        let (files, _) = select(&change, &pats(&["**/*.css"]), "app/[id]", &root).unwrap();
+        assert_eq!(files, vec!["app/[id]/page.css"]);
+        // A folder with no match for the glob: unmatched, and an error when alone.
+        let err = select(&change, &pats(&["*.tsx"]), "app/[id]", &root).unwrap_err();
+        assert_eq!(err, "--files matched nothing: *.tsx");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn select_globs_below_a_plain_prefix() {
+        let (root, change) = folder("below", &["sub/a.py", "sub/deep/b.py", "SUB2/c.py", "top.py"]);
+        let (files, _) = select(&change, &pats(&["*.py"]), "sub", &root).unwrap();
+        assert_eq!(files, vec!["sub/a.py"]);
+        let (files, _) = select(&change, &pats(&["**/*.py"]), "SUB", &root).unwrap();
+        assert_eq!(files, vec!["sub/a.py", "sub/deep/b.py"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_repository_file_must_be_readable() {
+        let o = cli::Opts::default();
+        let (root, change) = folder("waivers", &["a.py"]);
+        assert!(load_config(&o, &change).unwrap().waivers.file.is_none(), "no file: no waivers");
+        let write = |bytes: &[u8]| std::fs::write(root.join(waiver::FILE), bytes).unwrap();
+        // The listing is read once, so each case gets a fresh Change.
+        let fresh = || Change::new(root.clone(), Source::Dir, BTreeMap::new(), json!({}));
+        write(b"[[waiver]]\nrule = \"R\"\npaths = [\"*.py\"]\nreason = \"r\"\n");
+        let set = load_config(&o, &fresh()).unwrap().waivers;
+        assert_eq!((set.file.as_deref(), set.entries.len()), (Some("modern-tara.toml"), 1));
+        write(&[0xff, 0xfe, b'x']);
+        let err = load_config(&o, &fresh()).map(|_| ()).unwrap_err();
+        assert!(err.starts_with("modern-tara.toml: cannot read: ") && err.contains("UTF-8"), "{err}");
+        write(&vec![b'#'; change::MAX_FILE_BYTES + 1]);
+        let err = load_config(&o, &fresh()).map(|_| ()).unwrap_err();
+        assert!(err.starts_with("modern-tara.toml: cannot read: "), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn classic_scripts_survive_no_waivers_and_waivers_file() {
+        let (root, _) = folder("classic", &["a.py"]);
+        let fresh = || Change::new(root.clone(), Source::Dir, BTreeMap::new(), json!({}));
+        // The repository's waiver entry is broken: only `[js]` may be read when the list is off or replaced.
+        let repo = "[js]\nclassic-scripts = [\"public/**/*.js\"]\n\n[[waiver]]\nrule = \"R\"\nbogus = 1\n";
+        std::fs::write(root.join(waiver::FILE), repo).unwrap();
+        let off = cli::Opts { no_waivers: true, ..cli::Opts::default() };
+        let config = load_config(&off, &fresh()).unwrap();
+        assert!(config.waivers.file.is_none() && config.waivers.entries.is_empty());
+        assert!(config.classic_scripts.iter().any(|g| g.matches("public/a/app.js")), "--no-waivers keeps classic-scripts");
+        let err = load_config(&cli::Opts::default(), &fresh()).map(|_| ()).unwrap_err();
+        assert!(err.contains("waiver 1: unknown key `bogus`"), "{err}");
+
+        let other = root.join("other.toml");
+        std::fs::write(&other, "[[waiver]]\nrule = \"R2\"\npaths = [\"*.py\"]\nreason = \"r\"\n").unwrap();
+        let with_file = cli::Opts { waivers: Some(other.clone()), ..cli::Opts::default() };
+        let config = load_config(&with_file, &fresh()).unwrap();
+        assert_eq!(config.waivers.entries.len(), 1);
+        assert_eq!(config.waivers.entries[0].rule, "R2", "the repository's own list is ignored");
+        assert_eq!(config.waivers.file, Some(other.display().to_string()));
+        assert!(config.classic_scripts.iter().any(|g| g.matches("public/app.js")), "--waivers keeps the repository's [js]");
+
+        std::fs::write(&other, "[js]\nclassic-scripts = [\"x/*.js\"]\n").unwrap();
+        let err = load_config(&with_file, &fresh()).map(|_| ()).unwrap_err();
+        assert_eq!(err, format!("{}: [js] belongs in the repository's modern-tara.toml", other.display()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn select_names_a_pattern_over_the_brace_cap() {
+        let (root, change) = folder("cap", &["a.py"]);
+        let over = "{a,b}".repeat(9);
+        let err = select(&change, &pats(&["a.py", &over]), "", &root).unwrap_err();
+        assert!(err.starts_with(&format!("--files {over}: ")) && err.contains("256"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unmatched_lands_in_describe_and_warnings() {
+        let described = with_unmatched(json!({"mode": "files"}), &pats(&["*.rs"]));
+        assert_eq!(described["unmatched"], json!(["*.rs"]));
+        assert!(with_unmatched(json!({"mode": "files"}), &[]).get("unmatched").is_none());
+        let change = Change::new(PathBuf::new(), Source::Dir, BTreeMap::new(), described);
+        assert_eq!(unmatched_warnings(&change), vec!["--files *.rs matches nothing"]);
+    }
 }

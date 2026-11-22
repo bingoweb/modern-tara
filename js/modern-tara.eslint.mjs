@@ -65,11 +65,18 @@ function matcher(root, paths) {
   return (filePath) => wanted.has(norm(filePath));
 }
 
-function rulesFor({ ts, typeAware, esx: esxRules = [] }) {
+// A classic script (`sourceType: 'script'`, browser code in a package that
+// is not a module) cannot use these: they all ask for ES modules.
+export const MODULE_ONLY = ['prefer-module', 'prefer-top-level-await', 'prefer-import-meta-properties'];
+
+function rulesFor({ ts, typeAware, esx: esxRules = [], sourceType }) {
   const rules = {};
   for (const r of esxRules) rules[r] = 'warn';
   for (const r of UNICORN) rules[`unicorn/${r}`] = 'warn';
   for (const r of CORE) rules[r] = 'warn';
+  if (!ts && sourceType === 'script') {
+    for (const r of MODULE_ONLY) rules[`unicorn/${r}`] = 'off';
+  }
   if (ts) {
     for (const r of TS_UNTYPED) rules[`@typescript-eslint/${r}`] = 'warn';
     if (typeAware) {
@@ -112,7 +119,7 @@ export function buildConfig(root, files) {
       files: [matcher(root, group.map((f) => f.path))],
       languageOptions,
       plugins: ts ? { unicorn, '@typescript-eslint': tseslint.plugin } : { unicorn, 'es-x': esx },
-      rules: rulesFor({ ts, typeAware, esx: esxList }),
+      rules: rulesFor({ ts, typeAware, esx: esxList, sourceType }),
     });
   }
   return config;

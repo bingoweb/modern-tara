@@ -3,7 +3,7 @@ description: Runs modern-tara on the changed lines and stops only on high-confid
 
 inputs:
   version:
-    description: Release tag of modern-tara to run, such as v0.3.0. Default is the tag this action is used at.
+    description: Release tag of modern-tara to run, such as v0.4.0. Default is the tag this action is used at.
     required: false
     default: ""
   range:
@@ -12,6 +12,10 @@ inputs:
     default: ""
   args:
     description: More arguments for `modern-tara scan`, split on spaces (for example `--stacks rust,python`).
+    required: false
+    default: ""
+  waivers:
+    description: Waiver file in the checkout, passed as `--waivers`. Default is the scanned revision's own modern-tara.toml.
     required: false
     default: ""
 
@@ -92,6 +96,7 @@ runs:
         MODERN_TARA_HOME: ${{ steps.download.outputs.home }}
         MT_RANGE: ${{ inputs.range }}
         MT_ARGS: ${{ inputs.args }}
+        MT_WAIVERS: ${{ inputs.waivers }}
         MT_PR_BASE: ${{ github.event.pull_request.base.sha }}
         MT_PR_HEAD: ${{ github.event.pull_request.head.sha }}
         MT_BEFORE: ${{ github.event.before }}
@@ -133,6 +138,10 @@ runs:
         $report = Join-Path $env:RUNNER_TEMP 'modern-tara.json'
         $summary = Join-Path $env:RUNNER_TEMP 'modern-tara-summary.txt'
         $extra = @($env:MT_ARGS -split '\s+' | Where-Object { $_ })
+        if ($env:MT_WAIVERS) {
+          if (-not (Test-Path -LiteralPath $env:MT_WAIVERS -PathType Leaf)) { throw "modern-tara: waivers file '$($env:MT_WAIVERS)' not found in the checkout" }
+          $extra += @('--waivers', $env:MT_WAIVERS)
+        }
         & $env:MT_EXE scan --repo . @scope --gate --json $report @extra 2> $summary
         $code = $LASTEXITCODE
         $text = [string](Get-Content -LiteralPath $summary -Raw -Encoding utf8)

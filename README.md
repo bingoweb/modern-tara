@@ -36,6 +36,16 @@ modern-tara scan --repo . --files src/app.py --all-lines
 
 `--gate` yalnız kesin `modern` bulgu varsa 1 ile çıkar; `needs-newer` ve düşük güvenli bulgular uyarı olarak yazılır. Ayrıntılar: [docs/USAGE.md](docs/USAGE.md).
 
+Bazen eski biçim bilerek kalır: bir modül dizisi bitene kadar CommonJS, açılışı bekletmemesi gereken bir `.catch()` zinciri gibi. Bunları deponun kökündeki `modern-tara.toml` dosyasına kural, yol ve gerekçeyle yazıyorum; istenirse bir bitiş tarihi de veriliyor. Bu bulgular raporda `waived` olarak görünür ve kapıyı durdurmaz; süresi dolan istisnanın bulguları ise kendiliğinden yeniden sayılır.
+
+```toml
+[[waiver]]
+rule = "unicorn/prefer-module"
+paths = ["src/**/*.js"]
+reason = "ES modül dizisi bitene kadar CommonJS"
+expires = "2027-03-01"
+```
+
 ## Kurulum
 
 [Sürümler](https://github.com/bingoweb/modern-tara/releases) sayfasından işletim sistemine uygun zip'i indirip açın, sonra sabitlenmiş yardımcı araçları kurun:
@@ -50,7 +60,7 @@ Araç sürümleri `tools.toml` içinde tek yerde durur.
 ## GitHub Actions
 
 ```yaml
-- uses: bingoweb/modern-tara@v0.3.0
+- uses: bingoweb/modern-tara@v0.4.0
 ```
 
 Eylem sürümü indirir, SHA256'sını doğrular, araçları kurar ve pull request ya da push aralığını `--gate` ile tarar; özeti iş akışı sayfasına yazar.

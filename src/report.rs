@@ -123,6 +123,8 @@ pub struct StackReport {
     pub tool: String,
     pub status: Status,
     pub messages: Vec<String>,
+    /// Texts for the top-level `warnings` (and the stderr `warning:` lines).
+    pub warnings: Vec<String>,
     pub duration_ms: u64,
     pub findings: Vec<Finding>,
 }
@@ -137,6 +139,7 @@ impl StackReport {
             tool: String::new(),
             status: Status::Ok,
             messages: Vec::new(),
+            warnings: Vec::new(),
             duration_ms: 0,
             findings: Vec::new(),
         }
@@ -145,6 +148,13 @@ impl StackReport {
         let t = text.into();
         if !t.is_empty() && !self.messages.contains(&t) {
             self.messages.push(t);
+        }
+    }
+    /// A warning for the whole report, once.
+    pub fn warn(&mut self, text: impl Into<String>) {
+        let t = text.into();
+        if !t.is_empty() && !self.warnings.contains(&t) {
+            self.warnings.push(t);
         }
     }
     pub fn skip(&mut self, why: impl Into<String>) {
@@ -181,7 +191,15 @@ pub fn tidy(findings: &mut Vec<Finding>) {
     findings.dedup_by(|a, b| a.file == b.file && a.line == b.line && a.column == b.column && a.rule == b.rule && a.kind == b.kind);
 }
 
-pub fn document(version: &str, repo: &str, change: &Value, stacks: &[StackReport], findings: &[Finding]) -> Value {
+/// What a scan adds next to the findings: waived findings (as JSON, with their
+/// `waiver`), the `waivers` object and the warning texts.
+pub struct Extras<'a> {
+    pub waived: &'a [Value],
+    pub waivers: &'a Value,
+    pub warnings: &'a [String],
+}
+
+pub fn document(version: &str, repo: &str, change: &Value, stacks: &[StackReport], findings: &[Finding], extras: &Extras) -> Value {
     json!({
         "tool": "modern-tara",
         "version": version,
@@ -189,6 +207,9 @@ pub fn document(version: &str, repo: &str, change: &Value, stacks: &[StackReport
         "change": change,
         "stacks": stacks.iter().map(StackReport::to_json).collect::<Vec<_>>(),
         "findings": findings.iter().map(Finding::to_json).collect::<Vec<_>>(),
+        "waived": extras.waived,
+        "waivers": extras.waivers,
+        "warnings": extras.warnings,
     })
 }
 
@@ -206,8 +227,9 @@ fn counts<'a>(findings: impl Iterator<Item = &'a Finding>) -> String {
 
 /// A few lines for a human: per stack, status, counts per kind and
 /// confidence, time. `gate` is the `--gate` exit code: a final line says
-/// whether the gate passed (none for a tool error).
-pub fn summary(stacks: &[StackReport], findings: &[Finding], total_ms: u64, gate: Option<i32>) -> String {
+/// whether the gate passed (none for a tool error). `warnings` print before
+/// the totals line; `waived` is how many findings a waiver took out.
+pub fn summary(stacks: &[StackReport], findings: &[Finding], waived: usize, warnings: &[String], total_ms: u64, gate: Option<i32>) -> String {
     let mut out = String::new();
     for s in stacks {
         let counts = counts(findings.iter().filter(|f| f.stack == s.stack));
@@ -225,10 +247,14 @@ pub fn summary(stacks: &[StackReport], findings: &[Finding], total_ms: u64, gate
         out.push_str(line.trim_end());
         out.push('\n');
     }
+    for w in warnings {
+        let _ = writeln!(out, "modern-tara: warning: {w}");
+    }
+    let waived_text = if waived > 0 { format!(", {waived} waived") } else { String::new() };
     if findings.is_empty() {
-        let _ = writeln!(out, "modern-tara: 0 findings in {:.1}s", ms_to_s(total_ms));
+        let _ = writeln!(out, "modern-tara: 0 findings{waived_text} in {:.1}s", ms_to_s(total_ms));
     } else {
-        let _ = writeln!(out, "modern-tara: {} findings ({}) in {:.1}s", findings.len(), counts(findings.iter()), ms_to_s(total_ms));
+        let _ = writeln!(out, "modern-tara: {} findings ({}){waived_text} in {:.1}s", findings.len(), counts(findings.iter()), ms_to_s(total_ms));
     }
     match gate {
         Some(0) => out.push_str("modern-tara: gate passed\n"),
@@ -272,8 +298,12 @@ mod tests {
         s.newest("python", "3.15");
         s.tool = "ruff 0.17.6".into();
         let f = vec![finding("a.py", 3, Kind::Modern), finding("a.py", 4, Kind::NeedsNewer)];
-        let doc = document("0.1.0", "C:/r", &json!({"mode": "range"}), &[s], &f);
+        let none = Extras { waived: &[], waivers: &json!({"file": null, "entries": []}), warnings: &[] };
+        let doc = document("0.1.0", "C:/r", &json!({"mode": "range"}), &[s], &f, &none);
         assert_eq!(doc["tool"], "modern-tara");
+        assert_eq!(doc["waived"], json!([]));
+        assert_eq!(doc["waivers"], json!({"file": null, "entries": []}));
+        assert_eq!(doc["warnings"], json!([]));
         let stack = &doc["stacks"][0];
         for key in ["stack", "files", "pins", "newest", "tool", "status", "message", "duration_ms"] {
             assert!(stack.get(key).is_some(), "stack.{key}");
@@ -316,15 +346,32 @@ mod tests {
             low(finding("a.py", 3, Kind::Modern)),
             finding("a.py", 4, Kind::NeedsNewer),
         ];
-        let text = summary(std::slice::from_ref(&s), &f, 1500, Some(1));
+        let text = summary(std::slice::from_ref(&s), &f, 0, &[], 1500, Some(1));
         assert!(text.contains("2 modern high, 1 modern low, 1 needs-newer high"), "{text}");
         assert!(text.contains("modern-tara: 4 findings (2 modern high, 1 modern low, 1 needs-newer high) in 1.5s"), "{text}");
         assert!(text.ends_with("modern-tara: gate stopped (2 high-confidence modern findings)\n"), "{text}");
-        let passed = summary(std::slice::from_ref(&s), &f[2..], 0, Some(0));
+        let passed = summary(std::slice::from_ref(&s), &f[2..], 0, &[], 0, Some(0));
         assert!(passed.ends_with("modern-tara: gate passed\n"), "{passed}");
-        assert!(!summary(&[s], &[], 0, None).contains("modern-tara: gate"));
+        assert!(!summary(&[s], &[], 0, &[], 0, None).contains("modern-tara: gate"));
         assert_eq!(Confidence::parse("HIGH"), Confidence::High);
         assert_eq!(Confidence::parse(""), Confidence::Low);
+    }
+
+    #[test]
+    fn summary_says_waived_and_warns_before_the_totals() {
+        let s = StackReport::new("python", vec!["a.py".into()]);
+        let f = vec![finding("a.py", 1, Kind::Modern), finding("a.py", 2, Kind::NeedsNewer)];
+        let warnings = vec!["--files x* matches nothing".to_string(), "waiver 1 (UP006) matched nothing".to_string()];
+        let text = summary(std::slice::from_ref(&s), &f, 2, &warnings, 1200, None);
+        assert!(text.contains("modern-tara: 2 findings (1 modern high, 1 needs-newer high), 2 waived in 1.2s\n"), "{text}");
+        let totals = text.find("modern-tara: 2 findings").unwrap();
+        let first = text.find("modern-tara: warning: --files x* matches nothing\n").unwrap();
+        let second = text.find("modern-tara: warning: waiver 1 (UP006) matched nothing\n").unwrap();
+        assert!(first < second && second < totals, "{text}");
+        let zero = summary(std::slice::from_ref(&s), &[], 2, &[], 1200, None);
+        assert!(zero.ends_with("modern-tara: 0 findings, 2 waived in 1.2s\n"), "{zero}");
+        let none = summary(&[s], &[], 0, &[], 1200, None);
+        assert!(none.ends_with("modern-tara: 0 findings in 1.2s\n") && !none.contains("waived"), "{none}");
     }
 
     #[test]

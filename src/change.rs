@@ -253,33 +253,144 @@ fn walk(root: &Path) -> Vec<String> {
     out
 }
 
+/// Most plain patterns one brace pattern may expand to.
+pub const MAX_BRACE_EXPANSIONS: usize = 256;
+
 /// Glob match on `/` paths, ASCII case-insensitive: `**` spans segments,
-/// `*` and `?` stay inside one.
+/// `*`, `?` and `[...]` classes stay inside one; `{a,b}` is expanded first.
+/// A pattern over the expansion cap matches nothing.
 pub fn glob_match(pattern: &str, path: &str) -> bool {
-    let p: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
-    let s: Vec<&str> = path.split('/').collect();
-    match_segments(&p, &s)
+    Glob::new(pattern).is_ok_and(|g| g.matches(path))
 }
 
-fn match_segments(p: &[&str], s: &[&str]) -> bool {
-    match p.split_first() {
-        None => s.is_empty(),
-        Some((&"**", rest)) => (0..=s.len()).any(|i| match_segments(rest, &s[i..])),
-        Some((head, rest)) => !s.is_empty() && match_one(head.as_bytes(), s[0].as_bytes()) && match_segments(rest, &s[1..]),
+/// A glob compiled once: braces expanded, every alternative split into
+/// segments of chars. Matching never re-parses the pattern.
+#[derive(Debug, Clone)]
+pub struct Glob {
+    alternatives: Vec<Vec<Vec<char>>>,
+}
+
+impl Glob {
+    /// Errors when braces expand to more than [`MAX_BRACE_EXPANSIONS`] patterns.
+    pub fn new(pattern: &str) -> Result<Glob, String> {
+        let alternatives =
+            expand_braces(pattern)?.iter().map(|plain| plain.split('/').filter(|seg| !seg.is_empty()).map(|seg| seg.chars().collect()).collect()).collect();
+        Ok(Glob { alternatives })
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        let segments: Vec<Vec<char>> = path.split('/').map(|seg| seg.chars().collect()).collect();
+        self.alternatives.iter().any(|p| match_segments(p, &segments))
     }
 }
 
-fn match_one(p: &[u8], s: &[u8]) -> bool {
+/// `{a,b}` alternation turned into plain patterns, nested braces and empty
+/// alternatives included (`x{,.min}.js`). An unbalanced `{`, or a `{...}`
+/// without a top-level comma, stays literal. More than
+/// [`MAX_BRACE_EXPANSIONS`] results is an error.
+pub fn expand_braces(pattern: &str) -> Result<Vec<String>, String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    for open in (0..chars.len()).filter(|&i| chars[i] == '{') {
+        let Some((close, commas)) = brace_group(&chars, open) else { continue };
+        if commas.is_empty() {
+            continue;
+        }
+        let prefix: String = chars[..open].iter().collect();
+        let suffix: String = chars[close + 1..].iter().collect();
+        let mut bounds = vec![open];
+        bounds.extend(&commas);
+        bounds.push(close);
+        let mut out: Vec<String> = Vec::new();
+        for &[from, to] in bounds.array_windows() {
+            let alternative: String = chars[from + 1..to].iter().collect();
+            out.extend(expand_braces(&format!("{prefix}{alternative}{suffix}"))?);
+            if out.len() > MAX_BRACE_EXPANSIONS {
+                return Err(format!("more than {MAX_BRACE_EXPANSIONS} brace expansions"));
+            }
+        }
+        return Ok(out);
+    }
+    Ok(vec![pattern.to_string()])
+}
+
+/// The matching `}` of the `{` at `open` and the top-level commas between them.
+fn brace_group(chars: &[char], open: usize) -> Option<(usize, Vec<usize>)> {
+    let mut depth = 0usize;
+    let mut commas = Vec::new();
+    for (i, &c) in chars.iter().enumerate().skip(open) {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((i, commas));
+                }
+            }
+            ',' if depth == 1 => commas.push(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn match_segments(p: &[Vec<char>], s: &[Vec<char>]) -> bool {
     match p.split_first() {
         None => s.is_empty(),
-        Some((b'*', rest)) => (0..=s.len()).any(|i| match_one(rest, &s[i..])),
-        Some((b'?', rest)) => !s.is_empty() && match_one(rest, &s[1..]),
+        Some((head, rest)) if head == &['*', '*'] => (0..=s.len()).any(|i| match_segments(rest, &s[i..])),
+        Some((head, rest)) => s.first().is_some_and(|first| match_one(head, first)) && match_segments(rest, &s[1..]),
+    }
+}
+
+/// One path segment against one pattern segment.
+fn match_one(p: &[char], s: &[char]) -> bool {
+    match p.split_first() {
+        None => s.is_empty(),
+        Some(('*', rest)) => (0..=s.len()).any(|i| match_one(rest, &s[i..])),
+        Some(('?', rest)) => !s.is_empty() && match_one(rest, &s[1..]),
+        // No closing `]` in the segment: the `[` is a plain character (last arm).
+        Some(('[', rest)) if let Some((class, after)) = parse_class(rest) => !s.is_empty() && class.matches(s[0]) && match_one(after, &s[1..]),
         Some((c, rest)) => !s.is_empty() && c.eq_ignore_ascii_case(&s[0]) && match_one(rest, &s[1..]),
     }
 }
 
+/// A parsed `[...]`: inclusive character ranges, maybe negated.
+struct Class {
+    negated: bool,
+    ranges: Vec<(char, char)>,
+}
+
+impl Class {
+    fn matches(&self, c: char) -> bool {
+        let hit = [c.to_ascii_lowercase(), c.to_ascii_uppercase()].iter().any(|x| self.ranges.iter().any(|&(a, b)| (a..=b).contains(x)));
+        hit != self.negated
+    }
+}
+
+/// The class whose `[` was just consumed (`rest` starts after it), and what
+/// follows its `]`. `None` when there is no closing `]` in the segment.
+fn parse_class(rest: &[char]) -> Option<(Class, &[char])> {
+    let negated = matches!(rest.first(), Some('!' | '^'));
+    let start = usize::from(negated);
+    // A `]` first is a member, not the end.
+    let search_from = if rest.get(start) == Some(&']') { start + 1 } else { start };
+    let close = rest.iter().skip(search_from).position(|&c| c == ']')? + search_from;
+    let body = &rest[start..close];
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        if i + 2 < body.len() && body[i + 1] == '-' {
+            ranges.push((body[i], body[i + 2]));
+            i += 3;
+        } else {
+            ranges.push((body[i], body[i]));
+            i += 1;
+        }
+    }
+    Some((Class { negated, ranges }, &rest[close + 1..]))
+}
+
 pub fn is_glob(pattern: &str) -> bool {
-    pattern.contains(['*', '?'])
+    pattern.contains(['*', '?', '[', '{'])
 }
 
 #[cfg(test)]
@@ -329,6 +440,93 @@ mod tests {
         assert!(glob_match("**/*.rs", "a/b/c.rs"));
         assert!(glob_match("**/*.rs", "c.rs"));
         assert!(glob_match("SRC/?.CS", "src/a.cs"));
+    }
+
+    #[test]
+    fn glob_bracket_classes() {
+        assert!(glob_match("tests/[a-l]*.test.js", "tests/alpha.test.js"));
+        assert!(glob_match("tests/[a-l]*.test.js", "tests/Lima.test.js"), "ranges ignore ASCII case");
+        assert!(!glob_match("tests/[a-l]*.test.js", "tests/mike.test.js"));
+        assert!(glob_match("[abc].rs", "b.rs") && !glob_match("[abc].rs", "d.rs"));
+        assert!(glob_match("[a-l].rs", "B.rs") && glob_match("[A-L].rs", "b.rs"));
+        assert!(glob_match("[!_]*.py", "app.py") && !glob_match("[!_]*.py", "_private.py"));
+        assert!(glob_match("[^_]*.py", "app.py") && !glob_match("[^_]*.py", "_private.py"));
+        assert!(!glob_match("[!a].rs", "A.rs"), "negation ignores case too");
+        // A `]` right after `[`, `[!` or `[^` is a member.
+        assert!(glob_match("[]a].rs", "].rs") && glob_match("[]a].rs", "a.rs") && !glob_match("[]a].rs", "b.rs"));
+        assert!(glob_match("[!]a].rs", "b.rs") && !glob_match("[!]a].rs", "].rs"));
+        assert!(glob_match("[^]a].rs", "b.rs") && !glob_match("[^]a].rs", "a.rs"));
+        // `-` first or last is literal.
+        assert!(glob_match("[-a].rs", "-.rs") && glob_match("[a-].rs", "-.rs") && !glob_match("[-a].rs", "b.rs"));
+        assert!(glob_match("[a-c-e].rs", "-.rs") && glob_match("[a-c-e].rs", "e.rs") && glob_match("[a-c-e].rs", "b.rs") && !glob_match("[a-c-e].rs", "d.rs"));
+        // A class matches one character, never `/`.
+        assert!(!glob_match("a[/]b", "a/b") && !glob_match("a[!x]b", "a/b"));
+        assert!(!glob_match("[a-z]", "ab"));
+    }
+
+    #[test]
+    fn glob_literal_open_bracket() {
+        assert!(glob_match("app/[id]/page.tsx", "app/i/page.tsx"), "still a class");
+        assert!(!glob_match("app/[id]/page.tsx", "app/[id]/page.tsx"));
+        assert!(glob_match("a[b.rs", "a[b.rs"), "no closing bracket: literal");
+        assert!(glob_match("a[b/c]d.rs", "a[b/c]d.rs"), "a class never spans a segment");
+        assert!(glob_match("[", "[") && !glob_match("[", "a"));
+        assert!(glob_match("x[!", "x[!"));
+    }
+
+    #[test]
+    fn glob_braces() {
+        assert!(glob_match("*.{js,mjs}", "a.js") && glob_match("*.{js,mjs}", "a.MJS") && !glob_match("*.{js,mjs}", "a.cjs"));
+        assert!(glob_match("{src,lib}/**/*.ts", "src/a/b/c.ts") && glob_match("{src,lib}/**/*.ts", "lib/c.ts"));
+        assert!(!glob_match("{src,lib}/**/*.ts", "test/c.ts"));
+        assert!(glob_match("{a,{b,c}}d", "ad") && glob_match("{a,{b,c}}d", "bd") && glob_match("{a,{b,c}}d", "cd") && !glob_match("{a,{b,c}}d", "dd"));
+        assert!(glob_match("x{,.min}.js", "x.js") && glob_match("x{,.min}.js", "x.min.js") && !glob_match("x{,.min}.js", "x.max.js"));
+        assert!(glob_match("{a/b,c}/d", "a/b/d") && glob_match("{a/b,c}/d", "c/d"));
+        assert!(glob_match("{**/a,b}.rs", "x/y/a.rs") && glob_match("{**/a,b}.rs", "b.rs"));
+        // No comma, or no closing brace: literal.
+        assert!(glob_match("{a}.rs", "{a}.rs") && !glob_match("{a}.rs", "a.rs"));
+        assert!(glob_match("{a,b.rs", "{a,b.rs") && !glob_match("{a,b.rs", "a.rs"));
+        assert!(glob_match("a}.rs", "a}.rs"));
+        assert!(glob_match("{{a,b}}.rs", "{a}.rs") && glob_match("{{a,b}}.rs", "{b}.rs"));
+    }
+
+    #[test]
+    fn brace_expansion_lists_and_cap() {
+        assert_eq!(expand_braces("a{b,c}d").unwrap(), vec!["abd", "acd"]);
+        assert_eq!(expand_braces("{a,{b,c}}d").unwrap(), vec!["ad", "bd", "cd"]);
+        assert_eq!(expand_braces("x{,.min}.js").unwrap(), vec!["x.js", "x.min.js"]);
+        assert_eq!(expand_braces("{a}b").unwrap(), vec!["{a}b"]);
+        assert_eq!(expand_braces("plain/*.rs").unwrap(), vec!["plain/*.rs"]);
+        let exactly_256 = "{a,b}".repeat(8);
+        assert_eq!(expand_braces(&exactly_256).unwrap().len(), 256);
+        let over = "{a,b}".repeat(9);
+        let err = expand_braces(&over).unwrap_err();
+        assert!(err.contains("256"), "{err}");
+        assert!(!glob_match(&over, "aaaaaaaaa"), "over the cap: no match");
+        let huge = "{a,b}".repeat(40);
+        assert!(expand_braces(&huge).is_err());
+    }
+
+    #[test]
+    fn compiled_glob_matches_like_glob_match() {
+        let g = Glob::new("{src,lib}/**/[!_]*.{js,mjs}").unwrap();
+        for path in ["src/a.js", "lib/x/y/b.MJS", "src/_c.js", "app/a.js", "src/a.ts", "src"] {
+            assert_eq!(g.matches(path), glob_match("{src,lib}/**/[!_]*.{js,mjs}", path), "{path}");
+        }
+        assert!(g.matches("src/a.js") && g.matches("lib/x/y/b.MJS") && !g.matches("src/_c.js") && !g.matches("app/a.js"));
+        // One compiled glob serves many paths.
+        let paths: Vec<String> = (0..2000).map(|i| format!("src/d{i}/f{i}.js")).collect();
+        assert_eq!(paths.iter().filter(|p| g.matches(p)).count(), 2000);
+        assert!(Glob::new(&"{a,b}".repeat(9)).unwrap_err().contains("256"));
+        assert!(Glob::new(&"{a,b}".repeat(8)).is_ok());
+    }
+
+    #[test]
+    fn is_glob_knows_all_four() {
+        for p in ["*.rs", "a?.rs", "[ab].rs", "{a,b}.rs", "app/[id]/page.tsx"] {
+            assert!(is_glob(p), "{p}");
+        }
+        assert!(!is_glob("src/main.rs"));
     }
 
     #[test]

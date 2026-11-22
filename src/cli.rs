@@ -5,7 +5,7 @@ use std::time::Duration;
 
 pub const USAGE: &str = "usage: modern-tara scan [--repo <dir>] [--range <a>..<b> | --staged] [--files <f>...] [--all-lines]
                         [--stacks csharp,rust,python,js,css,powershell,go] [--json <out.json>] [--quiet]
-                        [--git-safe] [--timeout <seconds>] [--gate]
+                        [--git-safe] [--timeout <seconds>] [--gate] [--waivers <file> | --no-waivers]
        modern-tara --version
 
   --range a..b  changed lines of `git diff -U0 a b`, contents from revision b
@@ -19,6 +19,8 @@ pub const USAGE: &str = "usage: modern-tara scan [--repo <dir>] [--range <a>..<b
   --git-safe    trust a repository owned by another user (safe.directory, per command)
   --timeout S   per-stack timeout in seconds (defaults: rust 900, csharp 600, js 300, go 600 for the whole stack, others 120-180)
   --gate        exit 1 only for high-confidence `modern` findings; the others are warnings
+  --waivers F   read the waivers from file F instead of modern-tara.toml at the top level
+  --no-waivers  ignore waivers (audits); excludes --waivers
 
 exit: 0 no findings, 1 findings, 2 tool error (or a stack failed and nothing was found)
       with --gate: 1 only for high-confidence `modern` findings, 2 a stack failed and none was found";
@@ -38,10 +40,14 @@ pub struct Opts {
     pub timeout: Option<Duration>,
     /// `--gate`: only high-confidence `modern` findings make exit 1.
     pub gate: bool,
+    /// `--waivers FILE`: read the waivers from this file on disk.
+    pub waivers: Option<PathBuf>,
+    /// `--no-waivers`: ignore waivers entirely.
+    pub no_waivers: bool,
 }
 
 pub enum Command {
-    Scan(Opts),
+    Scan(Box<Opts>),
     Version,
     Help,
 }
@@ -74,6 +80,8 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             "--quiet" | "-q" => o.quiet = true,
             "--git-safe" => o.git_safe = true,
             "--gate" => o.gate = true,
+            "--no-waivers" => o.no_waivers = true,
+            "--waivers" => o.waivers = Some(PathBuf::from(value(&mut i, a)?)),
             "--json" => o.json_out = Some(PathBuf::from(value(&mut i, a)?)),
             "--timeout" => {
                 let secs: u64 = value(&mut i, a)?.parse().map_err(|_| "--timeout wants seconds")?;
@@ -105,7 +113,10 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     if o.range.is_some() && o.staged {
         return Err("--range and --staged exclude each other".into());
     }
-    Ok(Command::Scan(o))
+    if o.waivers.is_some() && o.no_waivers {
+        return Err("--waivers and --no-waivers exclude each other".into());
+    }
+    Ok(Command::Scan(Box::new(o)))
 }
 
 #[cfg(test)]
@@ -115,7 +126,7 @@ mod tests {
     fn scan(args: &[&str]) -> Opts {
         let v: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
         match parse(&v).unwrap() {
-            Command::Scan(o) => o,
+            Command::Scan(o) => *o,
             _ => panic!("not scan"),
         }
     }
@@ -129,6 +140,21 @@ mod tests {
         assert!(scan(&["scan", "--gate"]).gate);
         assert_eq!(o.stacks, Some(vec!["rust".into(), "python".into()]));
         assert_eq!(scan(&["scan", "--stacks", "Go,rust"]).stacks, Some(vec!["go".into(), "rust".into()]));
+        assert!(o.waivers.is_none() && !o.no_waivers);
+    }
+
+    #[test]
+    fn waiver_options() {
+        let w = scan(&["scan", "--waivers", "ci/waivers.toml", "--gate"]);
+        assert_eq!(w.waivers, Some(PathBuf::from("ci/waivers.toml")));
+        assert!(!w.no_waivers && w.gate);
+        let n = scan(&["scan", "--no-waivers"]);
+        assert!(n.no_waivers && n.waivers.is_none());
+        let both = parse(&["scan", "--waivers", "a.toml", "--no-waivers"].iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert!(both.is_err_and(|e| e.contains("exclude each other")));
+        let flipped = parse(&["scan", "--no-waivers", "--waivers", "a.toml"].iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert!(flipped.is_err());
+        assert!(USAGE.contains("--waivers") && USAGE.contains("--no-waivers"));
     }
 
     #[test]
@@ -139,6 +165,9 @@ mod tests {
         assert!(bad(&["scan", "--stacks", "cobol"]));
         assert!(bad(&["scan", "--range", "a..b", "--staged"]));
         assert!(bad(&["scan", "--files"]));
+        assert!(bad(&["scan", "--waivers"]));
+        assert!(bad(&["scan", "--waivers", "--gate"]));
+        assert!(bad(&["scan", "--waivers", "a.toml", "--no-waivers"]));
         assert!(bad(&["lint"]));
     }
 }

@@ -146,6 +146,12 @@ pub fn esx_rules_for(floor: (u32, u32, u32)) -> Vec<&'static str> {
 
 const TS_EXT: [&str; 4] = ["ts", "mts", "cts", "tsx"];
 
+/// Only `.js` and `.jsx` can be classic scripts; `.mjs`, `.cjs` and
+/// TypeScript keep their own module kind.
+fn is_classic_ext(ext: &str) -> bool {
+    matches!(ext, "js" | "jsx")
+}
+
 struct PackageInfo {
     path: Option<String>,
     engines: Option<String>,
@@ -241,6 +247,7 @@ pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
     let mut entries = Vec::new();
     let mut pins_json = serde_json::Map::new();
     let mut untyped = 0usize;
+    let mut kept_kind = 0usize;
     let mut ts_dirs: BTreeSet<String> = BTreeSet::new();
     let mut infos = Vec::new();
     for f in files {
@@ -254,7 +261,12 @@ pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
         if let Some(t) = &tsconfig {
             ts_dirs.insert(change::parent(t).to_string());
         }
+        let classic = ctx.classic_scripts.iter().any(|g| g.matches(f));
+        if classic && !is_classic_ext(&ext) {
+            kept_kind += 1;
+        }
         let source_type = match ext.as_str() {
+            _ if classic && is_classic_ext(&ext) => "script",
             "mjs" | "mts" => "module",
             "cjs" | "cts" => "commonjs",
             _ if is_ts || info.module => "module",
@@ -264,7 +276,14 @@ pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
         entries.push(json!({"path": f, "sourceType": source_type, "typeAware": tsconfig.is_some(), "ts": is_ts, "esx": esx}));
         pins_json.insert(
             f.clone(),
-            json!({"package.json": info.path, "engines.node": info.engines, "type": if info.module { "module" } else { "commonjs" }, "tsconfig": tsconfig}),
+            json!({
+                "package.json": info.path,
+                "engines.node": info.engines,
+                "type": if info.module { "module" } else { "commonjs" },
+                // The kind used for the parse (the requested one until the driver says otherwise).
+                "sourceType": source_type,
+                "tsconfig": tsconfig,
+            }),
         );
         infos.push((f.clone(), info, is_ts));
     }
@@ -274,7 +293,10 @@ pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
             JS_EXT.contains(&e.as_str()) || TS_EXT.contains(&e.as_str()) || e == "json"
         }));
     }
-    report.pin("files", Value::Object(pins_json));
+    report.pin("files", Value::Object(pins_json.clone()));
+    if kept_kind > 0 {
+        report.note(format!("{kept_kind} file(s) in classic-scripts keep their own module kind (.mjs/.cjs/TS)"));
+    }
     if untyped > 0 {
         report.note(format!("{untyped} TypeScript file(s) have no tsconfig.json: type-aware rules (prefer-optional-chain, prefer-nullish-coalescing, prefer-includes, prefer-string-starts-ends-with) skipped there."));
     }
@@ -307,6 +329,18 @@ pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
     report.tool = out.get("tool").and_then(Value::as_str).unwrap_or("eslint").to_string();
     for n in out.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
         report.note(n);
+    }
+    for w in out.get("warnings").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+        report.warn(w);
+    }
+    // The kind each file finally parsed as (a classic script that is really a module was re-linted as one).
+    if let Some(kinds) = out.get("kinds").and_then(Value::as_object) {
+        for (file, kind) in kinds {
+            if let Some(pin) = pins_json.get_mut(file).and_then(Value::as_object_mut) {
+                pin.insert("sourceType".into(), kind.clone());
+            }
+        }
+        report.pin("files", Value::Object(pins_json));
     }
     let table: Vec<_> = RULES.iter().chain(std::iter::once(&OBJECT_SHORTHAND)).collect();
     for r in out.get("results").and_then(Value::as_array).into_iter().flatten() {

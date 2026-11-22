@@ -57,6 +57,8 @@ async function runEslint() {
   const { buildConfig, ruleIds } = await import('./modern-tara.eslint.mjs');
   const wanted = ruleIds();
   const results = [];
+  const kinds = {};
+  const warnings = [];
   let files = job.files;
   let strictNullNote = false;
 
@@ -77,15 +79,24 @@ async function runEslint() {
       const entry = files.find((f) => f.path.toLowerCase() === file.toLowerCase());
       const fatal = r.messages.find((m) => m.fatal);
       if (fatal) {
-        if (attempt === 0 && entry) {
+        if (attempt === 0 && entry && !entry.ts && entry.sourceType === 'script') {
+          // Said to be a classic script but it is not one: lint it as the ES module it is.
+          retry.push({ ...entry, sourceType: 'module', fromScript: true });
+        } else if (attempt === 0 && entry) {
           // Retry once: the other module kind for JS, no type info for TS.
           if (entry.ts && entry.typeAware) retry.push({ ...entry, typeAware: false });
           else if (!entry.ts) retry.push({ ...entry, sourceType: entry.sourceType === 'module' ? 'commonjs' : 'module' });
           else notes.push(`${file}: ${fatal.message}`);
+        } else if (entry?.fromScript) {
+          notes.push(`${file}: not parsed as a classic script or as an ES module: ${fatal.message}`);
         } else {
           notes.push(`${file}: not parsed: ${fatal.message}`);
         }
         continue;
+      }
+      if (entry) {
+        kinds[entry.path] = entry.sourceType;
+        if (entry.fromScript) warnings.push(`${entry.path} is in classic-scripts but parses only as an ES module`);
       }
       for (const m of r.messages) {
         if (!m.ruleId || !(wanted.has(m.ruleId) || m.ruleId.startsWith('es-x/'))) continue;
@@ -104,7 +115,7 @@ async function runEslint() {
   }
   if (strictNullNote) notes.push('prefer-nullish-coalescing needs strictNullChecks; it was skipped where the tsconfig lacks it.');
   const tool = `eslint ${version('eslint')} (unicorn ${version('eslint-plugin-unicorn')}, es-x ${version('eslint-plugin-es-x')}, typescript-eslint ${version('typescript-eslint')}, typescript ${version('typescript')})`;
-  return { tool, results, notes };
+  return { tool, results, notes, warnings, kinds };
 }
 
 async function runStylelint() {

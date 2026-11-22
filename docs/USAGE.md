@@ -41,7 +41,7 @@ Side effects outside the repository:
 ```
 modern-tara scan [--repo <dir>] [--range <a>..<b> | --staged] [--files <f>...] [--all-lines]
                  [--stacks csharp,rust,python,js,css,powershell,go] [--json <out.json>] [--quiet]
-                 [--git-safe] [--timeout <seconds>] [--gate]
+                 [--git-safe] [--timeout <seconds>] [--gate] [--waivers <file> | --no-waivers]
 modern-tara --version     # this tool, every underlying tool, and tools.toml mismatches
 ```
 
@@ -62,6 +62,36 @@ modern-tara --version     # this tool, every underlying tool, and tools.toml mis
 - `--timeout` (and each default) applies **per child process**, not per stack,
   except for Go: there it is one budget for all go calls of the stack
   (default 600 s).
+- `--waivers FILE` reads the waivers from FILE instead of the repository's
+  `modern-tara.toml`; `--no-waivers` ignores every waiver (an audit's full
+  view). See [Waivers](#waivers).
+
+### `--files` patterns
+
+Paths are relative to `--repo`, with `/` or `\`. A pattern with `*`, `?`, `[`
+or `{` is a glob, matched ASCII case-insensitively against the change
+source's file list:
+
+| syntax | matches |
+|---|---|
+| `*`, `?` | any run of characters, one character, inside one path segment |
+| `**` | any number of whole segments (`src/**/*.js`, `**/*.css`) |
+| `[abc]`, `[a-l]`, `[!_]` or `[^_]` | one character from the class, or not from it; `]` first in the class is literal |
+| `{js,mjs}`, `{src,lib}/**`, `x{,.min}.js` | each alternative in turn, nested braces allowed (at most 256 expansions) |
+
+```
+modern-tara scan --range origin/main..HEAD --files "tests/[a-l]*.test.js" "src/*.{js,mjs}"
+```
+
+Quote patterns in the shell so it does not expand them first. A pattern
+that names an existing file is always taken literally first, so
+`--files "app/[id]/page.tsx"` scans that file and never `app/d/page.tsx`
+(`--repo "app/[id]"` is a plain folder too). A glob that matches nothing is
+**a warning, not an error**: the scan goes on with the other patterns,
+`change.unmatched` lists it and stderr says
+`modern-tara: warning: --files <p> matches nothing`. Only when every pattern
+matches nothing is it a tool error (exit 2), so a typo cannot pass a gate by
+scanning nothing. A plain path that does not exist is always an error.
 
 ### Exit codes and the gate
 
@@ -72,7 +102,8 @@ modern-tara --version     # this tool, every underlying tool, and tools.toml mis
 | `2` | tool error, or a stack failed and nothing was found | tool error, or a stack failed and no `modern` + `high` finding was found |
 
 `needs-newer`, `baseline` and every `low` finding never stop the gate; they
-are still in the JSON and in the counts. With `--gate` the last stderr line is
+are still in the JSON and in the counts. A finding an active waiver covers is
+never counted, with or without `--gate` ([Waivers](#waivers)). With `--gate` the last stderr line is
 `modern-tara: gate passed` (exit 0) or
 `modern-tara: gate stopped (<n> high-confidence modern findings)` (exit 1);
 exit 2 prints no gate line.
@@ -88,15 +119,25 @@ modern-tara: gate stopped (2 high-confidence modern findings)
 ## JSON
 
 ```json
-{ "tool": "modern-tara", "version": "0.3.0", "repo": "C:/...",
-  "change": { "mode": "range|staged|worktree|files", "from", "to", "all_lines", "files", "changed_lines", "git_safe" },
+{ "tool": "modern-tara", "version": "0.4.0", "repo": "C:/...",
+  "change": { "mode": "range|staged|worktree|files", "from", "to", "all_lines", "files", "changed_lines", "git_safe",
+              "unmatched": [] },
   "stacks": [ { "stack", "files": [], "pins": {}, "newest": {}, "tool": "ruff 0.17.6",
                 "status": "ok|skipped|error", "message", "duration_ms" } ],
   "findings": [ { "stack", "file", "line", "column", "rule", "message",
                   "kind": "modern|needs-newer|baseline", "confidence": "high|low",
                   "source": "tool|ast-grep",
-                  "upgrade": { "pin", "from", "to", "note" } | null } ] }
+                  "upgrade": { "pin", "from", "to", "note" } | null } ],
+  "waived": [ { ...the finding's keys..., "waiver": { "index", "rule", "reason", "card" } } ],
+  "waivers": { "file": "modern-tara.toml" | "<--waivers path>" | null,
+               "entries": [ { "index", "rule", "paths", "stack", "reason", "card", "expires",
+                              "status": "active|expired", "matched" } ] },
+  "warnings": [] }
 ```
+
+`change.unmatched` is there only when a `--files` glob matched nothing.
+`warnings` holds the texts of the warning lines stderr prints, without their
+`modern-tara: warning: ` prefix (also under `--quiet`).
 
 Paths are repo-relative with `/`. Kinds:
 
@@ -122,6 +163,96 @@ Confidence:
   `src/stacks/go.rs`.
 
 A missing tool sets the stack to `skipped`, and `message` says what to install.
+
+## Waivers
+
+A deliberate exception lives in `modern-tara.toml` at the repository's top
+level, one `[[waiver]]` table per exception (the file may also hold a `[js]`
+table, see [Classic browser scripts](#classic-browser-scripts); any other
+top-level key is refused):
+
+```toml
+# CommonJS stays until the ES-module series lands.
+[[waiver]]
+rule = "unicorn/prefer-module"
+paths = ["src/**/*.js", "bin/*.js"]
+reason = "CommonJS until the ES-module series; require(esm) callers break otherwise"
+card = "MT20"
+expires = "2027-03-01"
+
+# Fire-and-forget startup chains: awaiting would block startup.
+[[waiver]]
+rule = "unicorn/prefer-top-level-await"
+paths = ["server.js"]
+reason = "the .catch() chain must not block startup"
+
+# The kiosk browser still needs the prefixed property.
+[[waiver]]
+rule = "property-no-vendor-prefix"
+stack = "css"
+paths = ["kiosk/**/*.css"]
+reason = "kiosk-only -webkit-text-size-adjust"
+```
+
+| key | | meaning |
+|---|---|---|
+| `rule` | required | the finding's `rule`, ASCII case-insensitive; or a prefix ending in `*` (`unicorn/prefer-*`), which then needs `stack`. A bare `*`, or `*` elsewhere, is refused |
+| `paths` | required | one or more globs ([`--files` syntax](#--files-patterns)) relative to the top level, `/` or `\`, a leading `./` dropped; `..` and absolute paths are refused; `**` waives the rule in the whole repository |
+| `reason` | required | why the old form stays; shown with every waived finding |
+| `stack` | optional | only findings of this stack (`csharp`, `rust`, `python`, `js`, `css`, `powershell`, `go`) |
+| `card` | optional | the card or issue that removes the waiver |
+| `expires` | optional | `YYYY-MM-DD` (UTC); from the day after, the waiver is `expired` and waives nothing |
+
+The file is read **from the scanned source**: revision `b` of `--range a..b`,
+the index for `--staged`, the work tree otherwise. A waiver therefore goes
+through review like any other change, and a pull request that adds one shows
+it in its diff. Unknown keys, wrong types, empty strings, a bad date or a
+wildcard-only rule are a tool error (exit 2) naming the entry
+(`modern-tara.toml: waiver 2: ...`), and so is a `modern-tara.toml` that
+exists but cannot be read; a missing file means no waivers. If the system
+clock cannot be read, every entry with `expires` counts as expired.
+
+A finding is waived by the first active entry whose `rule`, `stack` and one
+of `paths` match it. Waived findings move from `findings` to `waived`, with
+the entry's index, rule, reason and card; they never count for the exit
+code, with or without `--gate`. The stderr total says how many were waived
+(`modern-tara: 3 findings (...), 2 waived in 1.2s`). Warnings, on stderr and
+in `warnings`:
+
+- an expired entry: `waiver <n> (<rule>) expired on <date> (card <card>); its
+  findings count again`, so an expiry reopens the gate on its own;
+- with `--all-lines` only, an active entry that matched nothing (in a diff
+  scan an idle waiver is normal): remove it or narrow it.
+
+`--no-waivers` shows everything as if there were no waivers; audits use it.
+`--waivers FILE` takes the waivers from a file on disk instead (relative to
+the current folder), for a shared or a trial list; FILE holds `[[waiver]]`
+entries only.
+
+### Classic browser scripts
+
+Files a page loads with a plain `<script>` (no `type="module"`) are not
+modules and never will be. Name them in the same file:
+
+```toml
+[js]
+classic-scripts = ["public/**/*.js", "kiosk/*.js"]
+```
+
+The globs follow the `paths` rules. A matching `.js` or `.jsx` file is parsed
+with `sourceType: "script"`, and `unicorn/prefer-module`,
+`unicorn/prefer-top-level-await` and `unicorn/prefer-import-meta-properties`
+are not run on it; every other rule is. Each file's entry in the stack's
+`pins.files` has `type` (the package kind, as before) and `sourceType` (the
+kind it was parsed as). `.mjs`, `.cjs` and TypeScript files keep their own
+kind even when a glob matches (the stack message counts them). A file in the
+list that only parses as an ES module is linted as a module with every rule,
+the three included, and raises the warning `<file> is in classic-scripts but
+parses only as an ES module`, so a too-broad glob cannot hide a module's
+findings. This is a fact about the files, not a waiver:
+no reason, no expiry. It is always read from the scanned source's
+`modern-tara.toml`; `--no-waivers` and `--waivers` leave it alone, and a
+`[js]` table in a `--waivers` file is refused.
 
 ## Rule selection
 
@@ -409,7 +540,7 @@ To move a pin: edit `tools.toml` (and, for npm, the exact versions in
   with:
     go-version: "1.27.4"
     cache: false
-- uses: bingoweb/modern-tara@v0.3.0
+- uses: bingoweb/modern-tara@v0.4.0
   with:
     args: --stacks rust,python,go
 ```
@@ -417,7 +548,9 @@ To move a pin: edit `tools.toml` (and, for npm, the exact versions in
 Inputs: `version` (a release tag; default the tag the action is used at),
 `range` (default: for a pull request `merge-base(base, head)..head`, else
 `github.event.before..github.sha`, or `sha~1..sha` for a new branch), `args`
-(more `scan` arguments, split on spaces). A push whose `before` is gone
+(more `scan` arguments, split on spaces), `waivers` (a waiver file in the
+checkout, passed as `--waivers`; default: the scanned revision's own
+`modern-tara.toml`, so most repositories leave it empty). A push whose `before` is gone
 (force push) first fetches that commit; if it is still missing, or `before`
 is all zeros, the range is `sha~1..sha`, and a root commit is scanned with
 `--all-lines`.
