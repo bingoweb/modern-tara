@@ -155,6 +155,7 @@ fn run_stack(ctx: &stacks::Ctx, stack: &'static str, files: &[String]) -> StackR
         "js" => stacks::js::run_js(ctx, files),
         "css" => stacks::js::run_css(ctx, files),
         "powershell" => stacks::powershell::run(ctx, files),
+        "go" => stacks::go::run(ctx, files),
         _ => StackReport::new(stack, files.to_vec()),
     };
     r.duration_ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -291,6 +292,8 @@ fn versions() -> String {
                     .args(args)
                     .cwd(&temp)
                     .env("DOTNET_NOLOGO", "1")
+                    // `go version` must not download the toolchain a GOTOOLCHAIN value names.
+                    .env("GOTOOLCHAIN", "local")
                     .run()
                     .ok()
                     .filter(proc::Output::ok)
@@ -319,6 +322,7 @@ fn versions() -> String {
             ("pwsh", s.spawn(|| run(&tools.pwsh, &["--version"]))),
             ("PSScriptAnalyzer", s.spawn(|| run(&tools.pwsh, &["-NoProfile", "-NonInteractive", "-Command", pssa_query]))),
             ("ast-grep", s.spawn(|| run(&tools.ast_grep, &["--version"]))),
+            ("go", s.spawn(|| run(&tools.go, &["version"]))),
         ];
         jobs.into_iter().map(|(n, h)| (n, h.join().unwrap_or_else(|_| "failed".into()))).collect()
     });

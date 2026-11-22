@@ -14,6 +14,7 @@ modern-tara bir değişikliğe bakar, hangi dillere dokunduğunu ve projenin sü
 | JavaScript / TypeScript | ESLint, eslint-plugin-unicorn, typescript-eslint, es-x | `engines.node` |
 | PowerShell | PSScriptAnalyzer | betiği çalıştıran kabuk |
 | CSS | stylelint, use-baseline, @eslint/css | `browserslist` |
+| Go | `go fix` modernleştiricileri (cmd/fix, `go vet -vettool` ile) | go.mod `go` satırı |
 
 Hiçbir kuralın yakalamadığı birkaç kalıp için ast-grep kuralları da var.
 
@@ -49,7 +50,7 @@ Araç sürümleri `tools.toml` içinde tek yerde durur.
 ## GitHub Actions
 
 ```yaml
-- uses: bingoweb/modern-tara@v0.2.0
+- uses: bingoweb/modern-tara@v0.3.0
 ```
 
 Eylem sürümü indirir, SHA256'sını doğrular, araçları kurar ve pull request ya da push aralığını `--gate` ile tarar; özeti iş akışı sayfasına yazar.

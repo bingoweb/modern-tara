@@ -1,7 +1,9 @@
 # The exact version of every external tool modern-tara runs.
 # `modern-tara --version` warns when an installed version differs;
 # scripts/install-tools.ps1 and scripts/install-tools.sh install these.
-# Rust, .NET, Node, git and pwsh come from the machine and are not pinned here.
+# Rust, .NET, Node, git, pwsh and Go come from the machine and are not pinned here.
+# Go's `go fix` modernizers (cmd/fix) ship with the Go toolchain, so there is
+# no golang.org/x/tools pin.
 
 [tools]
 ruff = "0.17.6"

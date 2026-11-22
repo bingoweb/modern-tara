@@ -3,6 +3,7 @@
 
 pub mod astgrep;
 pub mod csharp;
+pub mod go;
 pub mod js;
 pub mod powershell;
 pub mod python;
@@ -14,7 +15,7 @@ use crate::proc::{self, Cmd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const ALL: [&str; 6] = ["csharp", "rust", "python", "js", "css", "powershell"];
+pub const ALL: [&str; 7] = ["csharp", "rust", "python", "js", "css", "powershell", "go"];
 
 pub fn extensions(stack: &str) -> &'static [&'static str] {
     match stack {
@@ -24,6 +25,7 @@ pub fn extensions(stack: &str) -> &'static [&'static str] {
         "js" => &["js", "mjs", "cjs", "ts", "mts", "cts", "tsx", "jsx"],
         "css" => &["css"],
         "powershell" => &["ps1", "psm1"],
+        "go" => &["go"],
         _ => &[],
     }
 }
@@ -38,6 +40,7 @@ pub struct Tools {
     pub node: Option<PathBuf>,
     pub pwsh: Option<PathBuf>,
     pub ast_grep: Option<PathBuf>,
+    pub go: Option<PathBuf>,
 }
 
 impl Tools {
@@ -54,6 +57,7 @@ impl Tools {
             node: proc::which("node", &fallbacks("node")),
             pwsh: proc::which("pwsh", &fallbacks("pwsh")),
             ast_grep: proc::which("ast-grep", &[exe_in(&local_bin, "ast-grep"), exe_in(&cargo_bin, "ast-grep")]),
+            go: proc::which("go", &fallbacks("go")),
         }
     }
 }
@@ -72,6 +76,7 @@ pub fn fallbacks(name: &str) -> Vec<PathBuf> {
             "dotnet" => vec![pf.join("dotnet").join("dotnet.exe")],
             "node" => vec![pf.join("nodejs").join("node.exe")],
             "pwsh" => vec![pf.join("PowerShell").join("7").join("pwsh.exe")],
+            "go" => vec![pf.join("Go").join("bin").join("go.exe")],
             _ => Vec::new(),
         }
     } else {
@@ -79,6 +84,7 @@ pub fn fallbacks(name: &str) -> Vec<PathBuf> {
         match name {
             "dotnet" => vec![home.join(".dotnet").join("dotnet"), PathBuf::from("/usr/share/dotnet/dotnet"), PathBuf::from("/usr/lib/dotnet/dotnet")],
             "pwsh" => vec![PathBuf::from("/opt/microsoft/powershell/7/pwsh"), PathBuf::from("/usr/bin/pwsh")],
+            "go" => vec![PathBuf::from("/usr/local/go/bin/go"), PathBuf::from("/usr/lib/go/bin/go")],
             "git" | "node" => vec![PathBuf::from("/usr/bin").join(name)],
             _ => Vec::new(),
         }

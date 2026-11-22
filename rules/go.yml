@@ -1,0 +1,138 @@
+# Go catalogue rules for what `go fix` (cmd/fix) does not report right in go1.27.4.
+# The inline analyzer migrates ioutil.ReadAll/ReadFile/WriteFile/NopCloser/
+# TempFile/TempDir and reflect.Ptr/PtrTo only once a file's go line reaches the
+# toolchain's (std is "declared using go1.27.4"), so their rules here carry the
+# real minimum; the stack drops a go/inline finding on a line one of these has.
+# Go call and selector patterns parse as type conversions, so the rules match
+# node kinds and text.
+# metadata.gate/min: the go.mod `go` version that has the modern form.
+# metadata.confidence: high = exact pattern, low = heuristic (never stops --gate).
+id: go-ioutil-io-os
+language: go
+severity: info
+message: "`ioutil.ReadAll` / `ReadFile` / `WriteFile` / `NopCloser` / `TempFile` / `TempDir`: use `io.ReadAll`, `os.ReadFile`, `os.WriteFile`, `io.NopCloser`, `os.CreateTemp`, `os.MkdirTemp` (Go 1.16); io/ioutil is deprecated."
+metadata:
+  gate: go
+  min: "1.16"
+  confidence: high
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '^ioutil\.(ReadAll|ReadFile|WriteFile|NopCloser|TempFile|TempDir)$'
+---
+id: go-reflect-ptr-pointer
+language: go
+severity: info
+message: "`reflect.Ptr` / `reflect.PtrTo`: use `reflect.Pointer` / `reflect.PointerTo` (Go 1.18)."
+metadata:
+  gate: go
+  min: "1.18"
+  confidence: high
+rule:
+  any:
+    - kind: selector_expression
+      regex: '^reflect\.Ptr$'
+    - kind: call_expression
+      has:
+        field: function
+        regex: '^reflect\.PtrTo$'
+---
+id: go-importer-for
+language: go
+severity: info
+message: "`importer.For(compiler, lookup)`: use `importer.ForCompiler(token.NewFileSet(), compiler, lookup)` (Go 1.12)."
+metadata:
+  gate: go
+  min: "1.12"
+  confidence: high
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '^importer\.For$'
+---
+id: go-types-newsignature
+language: go
+severity: info
+message: "`types.NewSignature(recv, params, results, variadic)`: use `types.NewSignatureType(recv, nil, nil, params, results, variadic)` (Go 1.18)."
+metadata:
+  gate: go
+  min: "1.18"
+  confidence: high
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '^types\.NewSignature$'
+---
+id: go-ioutil-discard
+language: go
+severity: info
+message: "`ioutil.Discard`: use `io.Discard` (Go 1.16); io/ioutil is deprecated."
+metadata:
+  gate: go
+  min: "1.16"
+  confidence: high
+rule:
+  kind: selector_expression
+  regex: '^ioutil\.Discard$'
+---
+id: go-ioutil-readdir
+language: go
+severity: hint
+message: "`ioutil.ReadDir`: use `os.ReadDir` (Go 1.16); it returns `[]fs.DirEntry` instead of `[]fs.FileInfo`, so callers that need FileInfo call `Info()`."
+metadata:
+  gate: go
+  min: "1.16"
+  confidence: low
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '^ioutil\.ReadDir$'
+---
+id: go-sort-basic-slices-sort
+language: go
+severity: info
+message: "`sort.Strings` / `sort.Ints` / `sort.Float64s`: use `slices.Sort` (Go 1.21); since Go 1.22 these functions only call it."
+metadata:
+  gate: go
+  min: "1.21"
+  confidence: high
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '^sort\.(Strings|Ints|Float64s)$'
+---
+id: go-map-delete-loop-clear
+language: go
+severity: info
+message: "A loop that deletes every key of a map: use `clear(m)` (Go 1.21)."
+metadata:
+  gate: go
+  min: "1.21"
+  confidence: high
+rule:
+  pattern:
+    context: for $K := range $M { delete($M, $K) }
+    # `smart` also matches a body with more statements after the delete.
+    strictness: ast
+# Known gap: a loop whose body also holds a comment is not matched (neither
+# `ast` nor `relaxed` strictness skips the comment node in ast-grep 0.51.3).
+note: "Not matched when the loop body also holds a comment."
+---
+id: go-math-rand-v2
+language: go
+severity: hint
+message: "`math/rand`: consider `math/rand/v2` (Go 1.22), with a better default source and a cleaner API. Low confidence: seeded, reproducible sequences differ."
+metadata:
+  gate: go
+  min: "1.22"
+  confidence: low
+rule:
+  kind: import_spec
+  has:
+    field: path
+    regex: '^"math/rand"$'

@@ -145,6 +145,11 @@ fn check(stack: &str) {
 /// Like `check`, for fixture folder `fixture` scanned as `stack`; returns
 /// the stack's report (`None` when its tool is missing).
 fn check_fixture(fixture: &str, stack: &str) -> Option<Value> {
+    check_fixture_doc(fixture, stack).map(|(report, _)| report)
+}
+
+/// `check_fixture` that also returns the whole JSON document.
+fn check_fixture_doc(fixture: &str, stack: &str) -> Option<(Value, Value)> {
     let r = repo(fixture);
     let (code, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", stack]);
     let report = v["stacks"].as_array().unwrap().iter().find(|s| s["stack"] == stack).cloned().expect("stack report");
@@ -179,7 +184,7 @@ fn check_fixture(fixture: &str, stack: &str) -> Option<Value> {
     // Nothing written into the scanned repository (no obj/, caches, reports).
     let status = Command::new("git").args(["status", "--porcelain", "--ignored", "--untracked-files=all"]).current_dir(&r.0).output().unwrap();
     assert!(status.stdout.is_empty(), "{stack} wrote into the repo: {}", String::from_utf8_lossy(&status.stdout));
-    Some(report)
+    Some((report, v))
 }
 
 #[test]
@@ -219,6 +224,276 @@ fn css_fixture() {
 #[test]
 fn powershell_fixture() {
     check("powershell");
+}
+
+/// go 1.21: `interface{}` is modern, `strings.Split` ranges need 1.24, the
+/// three-clause loop 1.22 and the ioutil inline the toolchain's own Go; the
+/// Linux-only file is found by the GOOS=linux pass on other hosts. Skipped
+/// (the stack says why) when Go 1.26 or newer is not installed.
+#[test]
+fn go_fixture() {
+    let Some((report, v)) = check_fixture_doc("go", "go") else { return };
+    let tool = report["tool"].as_str().unwrap();
+    assert!(tool.ends_with(" cmd/fix"), "{tool}");
+    let message = report["message"].as_str().unwrap();
+    if !cfg!(target_os = "linux") {
+        assert!(message.contains("GOOS=linux pass analysed 1 file(s)"), "{message}");
+    }
+    assert!(message.contains("never builds tools/gen.go"), "{message}");
+    assert_eq!(report["pins"]["go"]["text.go"], "1.21 (go.mod)");
+    let findings = v["findings"].as_array().unwrap();
+    let find = |rule: &str| findings.iter().find(|f| f["rule"] == rule).unwrap_or_else(|| panic!("no {rule}: {v}"));
+    let to = |rule: &str| -> String {
+        let f = find(rule);
+        assert_eq!(f["upgrade"]["pin"], "go.mod go", "{f}");
+        f["upgrade"]["to"].as_str().unwrap().to_string()
+    };
+    assert_eq!(to("go/rangeint"), "1.22");
+    assert_eq!(to("go/stringsseq"), "1.24");
+    assert_eq!(to("go/omitzero"), "1.24");
+    assert_eq!(find("go/omitzero")["confidence"], "low", "omitzero changes encoding/json output");
+    assert_eq!(to("go-math-rand-v2"), "1.22");
+    // std calls the inliner migrates: one catalogue finding each. The only
+    // go/inline findings are the non-std callees declared with go1.24, one of
+    // them on a line a low catalogue rule (ioutil.ReadDir) also matched.
+    let inline: Vec<&Value> = findings.iter().filter(|f| f["rule"] == "go/inline").collect();
+    assert_eq!(inline.len(), 2, "{inline:?}");
+    for f in &inline {
+        assert_eq!((f["kind"].as_str(), f["upgrade"]["to"].as_str()), (Some("needs-newer"), Some("1.24")), "{f}");
+    }
+    let readdir = find("go-ioutil-readdir");
+    assert!(inline.iter().any(|f| f["line"] == readdir["line"]), "the low rule's line keeps its go/inline: {v}");
+    let read_line = findings.iter().filter(|f| f["file"] == "text.go" && f["rule"] == "go-ioutil-io-os").collect::<Vec<_>>();
+    assert_eq!(read_line.len(), 1, "{v}");
+    let line = read_line[0]["line"].clone();
+    let here: Vec<&Value> = findings.iter().filter(|f| f["file"] == "text.go" && f["line"] == line).collect();
+    assert_eq!(here.len(), 1, "one finding on the ioutil.ReadAll line: {here:?}");
+    assert_eq!((here[0]["kind"].as_str(), here[0]["confidence"].as_str()), (Some("modern"), Some("high")));
+}
+
+/// A go.work with two modules (`app` go 1.22, `lib` go 1.16): `app` imports
+/// `lib` through the workspace, and an untouched package of `app` embeds a
+/// folder git does not track. Both changes are found and nothing fails.
+#[test]
+fn go_workspace_fixture() {
+    let Some((report, v)) = check_fixture_doc("go-work", "go") else { return };
+    let message = report["message"].as_str().unwrap();
+    assert!(!message.contains("failed"), "{message}");
+    let lib: Vec<&Value> = v["findings"].as_array().unwrap().iter().filter(|f| f["file"] == "lib/lib.go").collect();
+    assert_eq!(lib.len(), 1, "go 1.16: ioutil.ReadAll is one modern high finding, no needs-newer: {lib:?}");
+    assert_eq!((lib[0]["rule"].as_str(), lib[0]["kind"].as_str(), lib[0]["confidence"].as_str()), (Some("go-ioutil-io-os"), Some("modern"), Some("high")));
+    assert_eq!(report["pins"]["go"]["lib/lib.go"], "1.16 (lib/go.mod)");
+    // The raised copy raises go.work too and runs without -mod=mod in a workspace.
+    assert!(message.contains("app: raised copy (go "), "{message}");
+    let seq = v["findings"].as_array().unwrap().iter().find(|f| f["file"] == "app/main.go" && f["rule"] == "go/stringsseq").unwrap_or_else(|| panic!("{v}"));
+    assert_eq!((seq["kind"].as_str(), seq["upgrade"]["to"].as_str()), (Some("needs-newer"), Some("1.24")), "{seq}");
+}
+
+/// A change to a package whose `//go:embed` target git does not track leaves
+/// that package out (named in `message`); the other changed package is analysed.
+#[test]
+fn go_package_go_cannot_load_is_left_out_not_fatal() {
+    let r = files_repo(
+        "go-embed",
+        &[("go.mod", "module example.com/e\n\ngo 1.21\n"), (".gitignore", "web/dist/\n")],
+        &[("web/web.go", "package web\n\nimport \"embed\"\n\n//go:embed dist\nvar FS embed.FS\n"), ("api/api.go", "package api\n\nfunc F(v interface{}) {}\n")],
+    );
+    let (_, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go"]);
+    let Some(report) = go_report(&v) else { return };
+    let message = report["message"].as_str().unwrap();
+    assert_eq!(report["status"], "ok", "{message}");
+    assert!(message.contains("example.com/e/web not analysed") && message.contains("pattern dist: no matching files found"), "{message}");
+    assert!(message.contains("build them before the scan"), "{message}");
+    assert!(v["findings"].as_array().unwrap().iter().any(|f| f["file"] == "api/api.go" && f["rule"] == "go/any"), "{v}");
+}
+
+/// The only changed package type-checks on Linux alone (`log/syslog` has no
+/// constants on Windows): the host pass fails, the GOOS=linux pass finds it.
+#[test]
+fn go_package_that_type_checks_only_on_linux_is_retried_there() {
+    let r = files_repo(
+        "go-syslog",
+        &[("go.mod", "module example.com/m\n\ngo 1.21\n")],
+        &[("svc/svc.go", "package svc\n\nimport \"log/syslog\"\n\nvar Level = syslog.LOG_INFO\n\nfunc F(v interface{}) {}\n")],
+    );
+    let (_, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go"]);
+    let Some(report) = go_report(&v) else { return };
+    assert_eq!(report["status"], "ok", "{}", report["message"]);
+    assert!(v["findings"].as_array().unwrap().iter().any(|f| f["file"] == "svc/svc.go" && f["line"] == 7 && f["rule"] == "go/any"), "{v}");
+}
+
+/// A changed unconstrained package imports a Linux-only internal package: go
+/// cannot load it on other hosts, so the GOOS=linux pass analyses it, alone
+/// and next to a portable change.
+#[test]
+fn go_package_importing_linux_only_code_is_retried_on_linux() {
+    let base = [
+        ("go.mod", "module example.com/m\n\ngo 1.21\n"),
+        ("lnx/lnx.go", "//go:build linux\n\npackage lnx\n\n// Name is Linux-only.\nfunc Name() string { return \"lnx\" }\n"),
+    ];
+    let svc = ("svc/svc.go", "package svc\n\nimport \"example.com/m/lnx\"\n\nvar N = lnx.Name\n\nfunc F(v interface{}) {}\n");
+    let api = ("api/api.go", "package api\n\nfunc G(v interface{}) {}\n");
+    for (name, change) in [("go-lnx", vec![svc]), ("go-lnx-api", vec![svc, api])] {
+        let r = files_repo(name, &base, &change);
+        let (_, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go"]);
+        let Some(report) = go_report(&v) else { return };
+        assert_eq!(report["status"], "ok", "{name}: {}", report["message"]);
+        for (file, _) in &change {
+            assert!(v["findings"].as_array().unwrap().iter().any(|f| f["file"] == *file && f["rule"] == "go/any"), "{name}: {file}: {v}");
+        }
+    }
+}
+
+/// Without the catalogue (a home with no rules/go.yml), a std call the
+/// inliner refuses below the toolchain's go line is one `modern` finding.
+#[test]
+fn go_std_inline_without_a_rule_is_modern_with_its_note() {
+    let r = files_repo(
+        "go-std-inline",
+        &[("go.mod", "module example.com/s\n\ngo 1.21\n")],
+        &[("a.go", "package s\n\nimport (\n\t\"io\"\n\t\"io/ioutil\"\n)\n\nfunc R(r io.Reader) []byte { b, _ := ioutil.ReadAll(r); return b }\n")],
+    );
+    let home = PathBuf::from(format!("{}-home", r.0.display()));
+    fs::create_dir_all(&home).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_modern-tara"))
+        .args(["scan", "--range", "HEAD~1..HEAD", "--stacks", "go", "--quiet", "--repo"])
+        .arg(&r.0)
+        .env("MODERN_TARA_HOME", &home)
+        .output()
+        .unwrap();
+    let _ = fs::remove_dir_all(&home);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("bad JSON ({e}): {}", String::from_utf8_lossy(&out.stderr)));
+    if go_report(&v).is_none() {
+        return;
+    }
+    let findings = v["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{v}");
+    let f = &findings[0];
+    assert_eq!((f["rule"].as_str(), f["kind"].as_str(), f["confidence"].as_str()), (Some("go/inline"), Some("modern"), Some("high")), "{f}");
+    assert!(f["message"].as_str().unwrap().contains("std replacement exists; go fix applies it once the go line reaches"), "{f}");
+}
+
+/// `--timeout` is one budget for all go calls: one second is not enough for
+/// the fixture's passes, so the stack fails and says it timed out.
+#[test]
+fn go_timeout_is_one_budget_and_fails_the_stack() {
+    let r = repo("go");
+    let (code, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go", "--timeout", "1"]);
+    let Some(report) = go_report(&v) else { return };
+    assert_eq!(report["status"], "error", "{v}");
+    assert!(report["message"].as_str().unwrap().contains("timed out after 1s"), "{v}");
+    assert_ne!(code, 0);
+}
+
+/// A repository from `(path, contents)` pairs: `base` as the first commit and,
+/// when `change` is not empty, `change` as the second.
+fn files_repo(name: &str, base: &[(&str, &str)], change: &[(&str, &str)]) -> TempRepo {
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("mt-test-{name}-{}-{n}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let guard = TempRepo(dir.clone());
+    let write = |files: &[(&str, &str)]| {
+        for (p, body) in files {
+            let f = dir.join(p);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, body).unwrap();
+        }
+    };
+    write(base);
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "--no-verify", "-m", "base"]);
+    if !change.is_empty() {
+        write(change);
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "--no-verify", "-m", "change"]);
+    }
+    guard
+}
+
+fn go_report(v: &Value) -> Option<Value> {
+    let report = v["stacks"].as_array().unwrap().iter().find(|s| s["stack"] == "go").cloned().expect("go report");
+    if report["status"] == "skipped" {
+        eprintln!("go: skipped ({})", report["message"]);
+        return None;
+    }
+    Some(report)
+}
+
+/// The user's environment cannot change the run: GOOS/GOARCH (a linux/386
+/// GOEXE has no `.exe`, darwin/386 does not exist), GOFLAGS, GO111MODULE,
+/// GOWORK and GOTOOLCHAIN are all replaced for every go call.
+#[test]
+fn go_ignores_the_users_go_environment() {
+    let r = files_repo(
+        "go-env",
+        &[
+            ("go.mod", "module example.com/env\n\ngo 1.21\n"),
+            ("a.go", "package env\n\nfunc F(v interface{}) {}\n"),
+            ("d.go", "//go:build darwin\n\npackage env\n\nfunc G(v interface{}) {}\n"),
+        ],
+        &[],
+    );
+    let bogus_work = r.0.join("missing").join("go.work");
+    let out = Command::new(env!("CARGO_BIN_EXE_modern-tara"))
+        .args(["scan", "--all-lines", "--stacks", "go", "--quiet", "--repo"])
+        .arg(&r.0)
+        .env("MODERN_TARA_HOME", env!("CARGO_MANIFEST_DIR"))
+        .env("GOOS", "linux")
+        .env("GOARCH", "386")
+        .env("GOFLAGS", "-mod=vendor")
+        .env("GO111MODULE", "off")
+        .env("GOWORK", &bogus_work)
+        .env("GOTOOLCHAIN", "go1.99.0")
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("bad JSON ({e}): {}", String::from_utf8_lossy(&out.stderr)));
+    let report = v["stacks"].as_array().unwrap().iter().find(|s| s["stack"] == "go").cloned().expect("go report");
+    let message = report["message"].as_str().unwrap_or_default();
+    if report["status"] == "skipped" && (message.starts_with("go not found") || message.contains("has no `go fix` modernizers")) {
+        eprintln!("go: skipped ({message})");
+        return;
+    }
+    assert_eq!(report["status"], "ok", "{message}");
+    for (file, line) in [("a.go", 3), ("d.go", 5)] {
+        assert!(v["findings"].as_array().unwrap().iter().any(|f| f["file"] == file && f["line"] == line && f["rule"] == "go/any"), "{file}:{line}: {v}");
+    }
+}
+
+/// A change only under `vendor/` is never analysed: ast-grep included.
+#[test]
+fn go_vendored_change_does_not_stop_the_gate() {
+    let dep = |body: &str| {
+        format!("package dep\n\nimport (\n\t\"io\"\n\t\"io/ioutil\"\n\t\"sort\"\n)\n\nvar W io.Writer = ioutil.Discard\n\nfunc S(x []string) {{\n{body}}}\n")
+    };
+    let r = files_repo(
+        "go-vendor",
+        &[
+            ("go.mod", "module example.com/v\n\ngo 1.21\n\nrequire example.com/dep v1.0.0\n"),
+            ("main.go", "package main\n\nimport _ \"example.com/dep\"\n\nfunc main() {}\n"),
+            ("vendor/modules.txt", "# example.com/dep v1.0.0\n## explicit\nexample.com/dep\n"),
+            ("vendor/example.com/dep/dep.go", &dep("")),
+        ],
+        &[("vendor/example.com/dep/dep.go", &dep("\tsort.Strings(x)\n"))],
+    );
+    let (code, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go", "--gate"]);
+    if go_report(&v).is_none() {
+        return;
+    }
+    assert!(v["findings"].as_array().unwrap().is_empty(), "{v}");
+    assert_eq!(code, 0, "{v}");
+}
+
+/// A go line newer than the toolchain is an error with the reason, never a download.
+#[test]
+fn go_module_newer_than_the_toolchain_is_an_error() {
+    let r = files_repo("go-new", &[("go.mod", "module example.com/n\n\ngo 1.99\n"), ("a.go", "package n\n\nfunc F(v interface{}) {}\n")], &[]);
+    let (code, v) = scan(&r.0, &["--all-lines", "--stacks", "go"]);
+    let Some(report) = go_report(&v) else { return };
+    assert_eq!(report["status"], "error", "{v}");
+    assert!(report["message"].as_str().unwrap().contains("never downloads a toolchain"), "{v}");
+    assert_eq!(code, 2);
 }
 
 #[test]

@@ -13,6 +13,7 @@ pub const NEWEST_PYTHON: (u32, u32) = (3, 15);
 pub const NEWEST_NODE: &str = "26";
 pub const NEWEST_ECMASCRIPT: &str = "2026";
 pub const NEWEST_PWSH: &str = "7.7";
+pub const NEWEST_GO: &str = "1.27";
 
 // ---------- MSBuild ----------
 
@@ -345,6 +346,203 @@ pub fn browserslistrc(text: &str) -> Vec<String> {
     out
 }
 
+// ---------- Go ----------
+
+/// A Go version as go.mod and `go env GOVERSION` write it. The order is the
+/// go command's: `1.21` < `1.21beta1` < `1.21rc1` < `1.21.0` < `1.21.1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GoVersion {
+    pub major: u32,
+    pub minor: u32,
+    /// 0: language version only (`1.21`), 1: beta, 2: rc, 3: release (`1.21.0`).
+    stage: u8,
+    /// The beta/rc number, or the patch.
+    n: u32,
+}
+
+impl GoVersion {
+    pub fn lang(major: u32, minor: u32) -> GoVersion {
+        GoVersion { major, minor, stage: 0, n: 0 }
+    }
+    /// `1.24`, for `upgrade.to` and step copies.
+    pub fn minor_text(self) -> String {
+        format!("{}.{}", self.major, self.minor)
+    }
+}
+
+/// `1.26.0`, `1.22`, `1.26rc1`, `go1.27.4` (the `go` prefix is optional);
+/// `None` for anything else, like the go.mod parser.
+pub fn go_version(text: &str) -> Option<GoVersion> {
+    let v = text.trim();
+    let v = v.trim_prefix("go");
+    let number = |s: &str| (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'))).then(|| s.parse().ok()).flatten();
+    let (major, rest) = v.split_once('.')?;
+    let major: u32 = number(major).filter(|m| *m >= 1)?;
+    let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let minor = number(&rest[..digits])?;
+    let mut rest = &rest[digits..];
+    let mut out = GoVersion::lang(major, minor);
+    if let Some(p) = rest.strip_prefix('.') {
+        let end = p.find(|c: char| !c.is_ascii_digit()).unwrap_or(p.len());
+        out = GoVersion { major, minor, stage: 3, n: number(&p[..end])? };
+        rest = &p[end..];
+    }
+    if !rest.is_empty() {
+        // `rc1`, `beta2`: lowercase letters, then digits.
+        let letters = rest.find(|c: char| !c.is_ascii_lowercase()).unwrap_or(rest.len());
+        let n = number(&rest[letters..])?;
+        if letters == 0 || out.stage == 3 {
+            return None;
+        }
+        let stage = if &rest[..letters] == "rc" { 2 } else { 1 };
+        out = GoVersion { major, minor, stage, n };
+    }
+    Some(out)
+}
+
+/// The `go` and `toolchain` directives of a go.mod, as written.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GoMod {
+    pub go: Option<String>,
+    pub toolchain: Option<String>,
+}
+
+/// Go's rule for a go.mod without a `go` line: it means Go 1.16.
+pub const GO_MOD_DEFAULT: (u32, u32) = (1, 16);
+
+pub fn go_mod(text: &str) -> GoMod {
+    let mut out = GoMod::default();
+    for line in text.trim_start_matches('\u{feff}').lines() {
+        let code = line.split("//").next().unwrap_or("").trim();
+        let mut words = code.split_whitespace();
+        let (Some(verb), Some(value), None) = (words.next(), words.next(), words.next()) else { continue };
+        match verb {
+            "go" if out.go.is_none() => out.go = Some(value.to_string()),
+            "toolchain" if out.toolchain.is_none() => out.toolchain = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `use` folders of a go.work, as written.
+pub fn go_work_uses(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in text.trim_start_matches('\u{feff}').lines() {
+        let code = line.split("//").next().unwrap_or("").trim();
+        let spec = if in_block {
+            if code == ")" {
+                in_block = false;
+                continue;
+            }
+            code
+        } else {
+            let Some(rest) = code.strip_prefix("use").filter(|r| r.starts_with([' ', '\t', '('])) else { continue };
+            let rest = rest.trim_start();
+            if rest == "(" {
+                in_block = true;
+                continue;
+            }
+            rest
+        };
+        let path = spec.trim().trim_matches('"');
+        if !path.is_empty() {
+            out.push(path.to_string());
+        }
+    }
+    out
+}
+
+/// Local folders of go.mod `replace` directives (`=> ../lib`), as written.
+pub fn go_mod_replaces(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        let code = line.split("//").next().unwrap_or("").trim();
+        let spec = if in_block {
+            if code == ")" {
+                in_block = false;
+                continue;
+            }
+            code
+        } else {
+            let Some(rest) = code.strip_prefix("replace").filter(|r| r.starts_with([' ', '\t', '('])) else { continue };
+            let rest = rest.trim_start();
+            if rest == "(" {
+                in_block = true;
+                continue;
+            }
+            rest
+        };
+        let Some((_, target)) = spec.split_once("=>") else { continue };
+        let path = target.split_whitespace().next().unwrap_or("");
+        if path == "." || path == ".." || ["./", "../", ".\\", "..\\"].iter().any(|p| path.starts_with(p)) {
+            out.push(path.to_string());
+        }
+    }
+    out
+}
+
+/// go.mod with the `go` line set to `version` (added after `module` when
+/// missing) and every `toolchain` line removed; line endings are kept.
+pub fn raise_go_mod(text: &str, version: &str) -> String {
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut done = false;
+    let mut after_module: Option<usize> = None;
+    for line in text.split_inclusive('\n') {
+        let first = line.split("//").next().unwrap_or("").split_whitespace().next().unwrap_or("");
+        match first {
+            "toolchain" => continue,
+            "go" if !done => {
+                out.push_str("go ");
+                out.push_str(version);
+                out.push_str(eol);
+                done = true;
+                continue;
+            }
+            _ => {}
+        }
+        out.push_str(line);
+        if first == "module" && after_module.is_none() {
+            if !out.ends_with('\n') {
+                out.push_str(eol);
+            }
+            after_module = Some(out.len());
+        }
+    }
+    if !done {
+        let line = format!("{eol}go {version}{eol}");
+        if let Some(at) = after_module {
+            out.insert_str(at, &line);
+        } else {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push_str(eol);
+            }
+            out.push_str(line.trim_start_matches(['\r', '\n']));
+        }
+    }
+    out
+}
+
+/// The `//go:build` expression of a Go file (before its `package` clause).
+pub fn go_build_constraint(text: &str) -> Option<String> {
+    for line in text.trim_start_matches('\u{feff}').lines() {
+        let l = line.trim();
+        if let Some(expr) = l.strip_prefix("//go:build") {
+            if expr.starts_with([' ', '\t']) {
+                return Some(expr.trim().to_string());
+            }
+            continue;
+        }
+        if l.starts_with("package ") || l == "package" {
+            return None;
+        }
+    }
+    None
+}
+
 // ---------- shared ----------
 
 /// Leading `X.Y` of a version text (`3.12.1` → (3, 12), `20` → (20, 0)).
@@ -523,6 +721,62 @@ mod tests {
         assert_eq!(baseline_available(&["baseline newly available".into()]), serde_json::json!("newly"));
         assert_eq!(baseline_available(&["> 0.5%".into(), "not dead".into()]), serde_json::json!("widely"));
         assert_eq!(browserslistrc("# c\n> 1%, last 2 versions\n[dev]\nlast 1 chrome version\n"), vec!["> 1%", "last 2 versions"]);
+    }
+
+    #[test]
+    fn go_versions_and_order() {
+        let v = |s: &str| go_version(s).unwrap();
+        assert_eq!(v("1.26.0"), GoVersion { major: 1, minor: 26, stage: 3, n: 0 });
+        assert_eq!(v("go1.27.4").minor_text(), "1.27");
+        assert_eq!(v("1.22"), GoVersion::lang(1, 22));
+        assert!(v("1.21") < v("1.21beta1") && v("1.21beta1") < v("1.21rc1") && v("1.21rc1") < v("1.21.0") && v("1.21.0") < v("1.21.1"));
+        assert!(v("1.26rc1") < v("go1.27.4") && v("1.27.5") > v("go1.27.4") && v("1.9") < v("1.16"));
+        assert_eq!(v("1.26rc1").minor_text(), "1.26");
+        for junk in ["", "1", "1.x", "1.26.0.1", "1.021", "1.26rc", "1.26-rc1", "1.26.0rc1", "v1.26", "abc", "devel go1.28-abc"] {
+            assert_eq!(go_version(junk), None, "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn go_mod_directives() {
+        let m = go_mod("\u{feff}module example.com/a\r\n\r\ngo 1.26.0 // pinned\r\ntoolchain go1.27.1\r\n\r\nrequire (\r\n\tgo.uber.org/zap v1.27.0\r\n)\r\n");
+        assert_eq!(m.go.as_deref(), Some("1.26.0"));
+        assert_eq!(m.toolchain.as_deref(), Some("go1.27.1"));
+        assert_eq!(go_mod("module x\n\nrequire golang.org/x/sys v0.1.0\n"), GoMod::default(), "missing go line");
+        assert_eq!(go_mod("module x\ngo 1.26rc1\n").go.as_deref(), Some("1.26rc1"));
+        assert_eq!(go_mod("module x\ngo 1.2x\n").go.and_then(|g| go_version(&g)), None, "junk stays unparsed");
+        assert_eq!(go_mod("module x\n// go 1.30\ngo 1.21\n").go.as_deref(), Some("1.21"));
+    }
+
+    #[test]
+    fn go_mod_local_replaces() {
+        let text = "module x\nreplace example.com/a => ../a // local\nreplace (\n\texample.com/b v1.0.0 => ./third_party/b\n\texample.com/c => example.com/c2 v1.2.0\n)\nreplacement x\n";
+        assert_eq!(go_mod_replaces(text), vec!["../a", "./third_party/b"]);
+    }
+
+    #[test]
+    fn go_work_use_folders() {
+        let text = "go 1.22\n\nuse ./app // main\nuse (\n\t./lib\n\t\"./with space\"\n)\nuser x\n";
+        assert_eq!(go_work_uses(text), vec!["./app", "./lib", "./with space"]);
+        assert_eq!(go_mod(&raise_go_mod("go 1.22\ntoolchain go1.23.0\nuse .\n", "1.27.4")).go.as_deref(), Some("1.27.4"), "go.work raises like go.mod");
+    }
+
+    #[test]
+    fn go_mod_raise() {
+        let r = raise_go_mod("module x\r\n\r\ngo 1.21\r\n\r\ntoolchain go1.22.3\r\n\r\nrequire go.uber.org/zap v1.27.0\r\n", "1.27.4");
+        assert_eq!(r, "module x\r\n\r\ngo 1.27.4\r\n\r\n\r\nrequire go.uber.org/zap v1.27.0\r\n");
+        let r = raise_go_mod("module x\nrequire (\n\tgolang.org/x/sys v0.1.0\n)\n", "1.24");
+        assert_eq!(r, "module x\n\ngo 1.24\nrequire (\n\tgolang.org/x/sys v0.1.0\n)\n");
+        assert_eq!(raise_go_mod("module x", "1.24"), "module x\n\ngo 1.24\n");
+        assert_eq!(go_mod(&raise_go_mod("module x\ngo 1.16\n", "1.22")).go.as_deref(), Some("1.22"));
+    }
+
+    #[test]
+    fn go_build_lines() {
+        assert_eq!(go_build_constraint("// Copyright\n\n//go:build linux && amd64\n\npackage board\n").as_deref(), Some("linux && amd64"));
+        assert_eq!(go_build_constraint("//go:build ignore\npackage main\n").as_deref(), Some("ignore"));
+        assert_eq!(go_build_constraint("package a\n//go:build linux\n"), None, "after the package clause it is a comment");
+        assert_eq!(go_build_constraint("//go:buildx linux\npackage a\n"), None);
     }
 
     #[test]

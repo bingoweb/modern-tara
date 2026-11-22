@@ -3,7 +3,7 @@ description: Runs modern-tara on the changed lines and stops only on high-confid
 
 inputs:
   version:
-    description: Release tag of modern-tara to run, such as v0.2.0. Default is the tag this action is used at.
+    description: Release tag of modern-tara to run, such as v0.3.0. Default is the tag this action is used at.
     required: false
     default: ""
   range:

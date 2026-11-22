@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub const USAGE: &str = "usage: modern-tara scan [--repo <dir>] [--range <a>..<b> | --staged] [--files <f>...] [--all-lines]
-                        [--stacks csharp,rust,python,js,css,powershell] [--json <out.json>] [--quiet]
+                        [--stacks csharp,rust,python,js,css,powershell,go] [--json <out.json>] [--quiet]
                         [--git-safe] [--timeout <seconds>] [--gate]
        modern-tara --version
 
@@ -17,7 +17,7 @@ pub const USAGE: &str = "usage: modern-tara scan [--repo <dir>] [--range <a>..<b
   --json FILE   write the JSON report to FILE instead of stdout
   --quiet       no summary on stderr
   --git-safe    trust a repository owned by another user (safe.directory, per command)
-  --timeout S   per-stack timeout in seconds (defaults: rust 900, csharp 600, js 300, others 120-180)
+  --timeout S   per-stack timeout in seconds (defaults: rust 900, csharp 600, js 300, go 600 for the whole stack, others 120-180)
   --gate        exit 1 only for high-confidence `modern` findings; the others are warnings
 
 exit: 0 no findings, 1 findings, 2 tool error (or a stack failed and nothing was found)
@@ -128,6 +128,7 @@ mod tests {
         assert!(o.all_lines && o.quiet && !o.gate);
         assert!(scan(&["scan", "--gate"]).gate);
         assert_eq!(o.stacks, Some(vec!["rust".into(), "python".into()]));
+        assert_eq!(scan(&["scan", "--stacks", "Go,rust"]).stacks, Some(vec!["go".into(), "rust".into()]));
     }
 
     #[test]
@@ -135,7 +136,7 @@ mod tests {
         let bad = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()).is_err();
         assert!(bad(&["scan", "--range", "a...b"]));
         assert!(bad(&["scan", "--range", "a.."]));
-        assert!(bad(&["scan", "--stacks", "go"]));
+        assert!(bad(&["scan", "--stacks", "cobol"]));
         assert!(bad(&["scan", "--range", "a..b", "--staged"]));
         assert!(bad(&["scan", "--files"]));
         assert!(bad(&["lint"]));

@@ -14,6 +14,10 @@ with the rights of the user who started modern-tara. `--git-safe` only trusts
 the repository's ownership for git; it does not sandbox anything. Do not point
 modern-tara at code you would not build yourself.
 
+The Go stack type-checks repository code with `go vet`; it runs no `go generate`
+and no tests, but a cgo package makes vet run the C compiler (and
+`pkg-config`, if its `#cgo` lines ask for it) on the cgo preamble.
+
 The copy never includes `target/`, `bin/` or `obj/` that are build output:
 next to a `Cargo.toml` or .NET project, and untracked. Tracked sources under
 such names (`src/bin/*.rs`) are copied.
@@ -27,12 +31,16 @@ Side effects outside the repository:
 - Every child process inherits `RUSTUP_AUTO_INSTALL=0`, and version probes run
   from the temp folder, so a project's `rust-toolchain.toml` never makes rustup
   install anything.
+- `go vet` fills the Go module cache (`GOMODCACHE`, downloads through
+  `GOPROXY`) and the build cache (`GOCACHE`). Every go call runs with
+  `GOTOOLCHAIN=local`, so a go.mod `go` or `toolchain` line never downloads
+  a toolchain.
 
 ## Command line
 
 ```
 modern-tara scan [--repo <dir>] [--range <a>..<b> | --staged] [--files <f>...] [--all-lines]
-                 [--stacks csharp,rust,python,js,css,powershell] [--json <out.json>] [--quiet]
+                 [--stacks csharp,rust,python,js,css,powershell,go] [--json <out.json>] [--quiet]
                  [--git-safe] [--timeout <seconds>] [--gate]
 modern-tara --version     # this tool, every underlying tool, and tools.toml mismatches
 ```
@@ -51,7 +59,9 @@ modern-tara --version     # this tool, every underlying tool, and tools.toml mis
 - `--git-safe` adds `-c safe.directory=<repo>` to each git call (for
   repositories owned by another user). Git always runs with
   `--no-optional-locks` and fsmonitor off.
-- `--timeout` (and each default) applies **per child process**, not per stack.
+- `--timeout` (and each default) applies **per child process**, not per stack,
+  except for Go: there it is one budget for all go calls of the stack
+  (default 600 s).
 
 ### Exit codes and the gate
 
@@ -78,7 +88,7 @@ modern-tara: gate stopped (2 high-confidence modern findings)
 ## JSON
 
 ```json
-{ "tool": "modern-tara", "version": "0.2.0", "repo": "C:/...",
+{ "tool": "modern-tara", "version": "0.3.0", "repo": "C:/...",
   "change": { "mode": "range|staged|worktree|files", "from", "to", "all_lines", "files", "changed_lines", "git_safe" },
   "stacks": [ { "stack", "files": [], "pins": {}, "newest": {}, "tool": "ruff 0.17.6",
                 "status": "ok|skipped|error", "message", "duration_ms" } ],
@@ -98,15 +108,18 @@ Paths are repo-relative with `/`. Kinds:
 Confidence:
 
 - **high**: every finding of a rule engine (ruff, clippy, `dotnet format`,
-  ESLint, stylelint, @eslint/css, PSScriptAnalyzer), and ast-grep catalogue
-  rules whose pattern is the old form itself.
+  ESLint, stylelint, @eslint/css, PSScriptAnalyzer, `go fix`), and ast-grep
+  catalogue rules whose pattern is the old form itself.
 - **low**: ast-grep catalogue heuristics, where the old form is often right
   where it is. The level is `metadata.confidence` in each `rules/*.yml` rule
   (a rule without it counts as `low`). Low today: `csharp-datetime-now`,
   `csharp-httpclient-per-call`, `csharp-new-random`, `python-asyncio-gather`,
-  `javascript-http-client-package` and its `typescript-` and `tsx-` twins.
+  `javascript-http-client-package` and its `typescript-` and `tsx-` twins,
+  `go-ioutil-readdir`, `go-math-rand-v2`.
   Also low: stylelint `declaration-block-no-redundant-longhand-properties`
-  (see [Rule selection](#rule-selection)).
+  (see [Rule selection](#rule-selection)), `go/omitzero` (its fix changes
+  encoding/json output) and any `go fix` analyzer not yet in `ANALYZERS` in
+  `src/stacks/go.rs`.
 
 A missing tool sets the stack to `skipped`, and `message` says what to install.
 
@@ -248,6 +261,66 @@ paths. Rules: PSAvoidUsingWMICmdlet gives `modern`; PSUseCompatibleSyntax
 gives `baseline`, with TargetVersions 7.0, 5.1, or both for an unknown host. A
 5.1 host adds a needs-newer note: PowerShell 7.7 is the newest stable.
 
+**Go** (`.go`). Needs Go 1.26 or newer, whose `go fix` (cmd/fix) has the
+modernizers; with an older Go or none the stack is `skipped`. Pins: the `go`
+line of the nearest `go.mod` (`go 1.26.0`, `go 1.22`; a go.mod without one
+counts as 1.16, as in Go). A module whose `go` line is newer than the
+installed toolchain fails with that reason. Each module is copied: go.mod,
+go.sum, `vendor/`, and every file in a folder that holds a .go file or below
+such a folder (so `//go:embed` finds its files). Nested modules stay out;
+folders of local `replace` directives come along. When the nearest `go.work`
+at or above the module lists it in `use`, the copy also gets that go.work,
+its go.work.sum and every `use` module in the same layout, and `GOWORK` points
+at the copied go.work; otherwise `GOWORK=off`. Only changed files the go tool
+builds are analysed, by the tool and by the catalogue: changes under
+`vendor/` or `testdata/`, `_` or `.` names and `//go:build ignore` files are
+named in `message` and skipped, and `.go` files with no go.mod above them
+are not analysed at all (no catalogue either). `go list -e -json ./...` for
+the host GOOS says which changed files that build compiled (GoFiles,
+CgoFiles, TestGoFiles, XTestGoFiles), and only the packages holding them are
+vetted: `go vet -vettool=<GOTOOLDIR>/fix -json -buildtag=false
+-hostport=false ./<pkg>` for each (`buildtag` and `hostport` are correctness
+checks, not modernizers). The folders of the other changed files are listed
+and vetted again with GOOS=linux, then windows, then darwin (GOARCH=amd64,
+`CGO_ENABLED=0`), until each file is covered; `message` names the files no
+GOOS compiled. A package counts as analysed when vet printed its entry, even
+if its test variant failed. A package vet names as failed (a `# pkg` header,
+such as code that type-checks only on Linux) is retried under the next GOOS;
+the module fails only when no GOOS analysed any changed file, with each
+GOOS's error line. A changed package go cannot load (`go list`
+`Error` or `DepsErrors`, such as a `//go:embed` pattern on files git does not
+track) is left out of vet and named in `message` with its error and what to
+do; the stack fails only when no changed package of the host pass loads. A
+finding's rule is `go/<analyzer>`, kind `modern`, confidence `high`, except
+`go/omitzero` and analyzers not in `ANALYZERS` (`low`). An `inline`
+diagnostic without a fix ("cannot inline call to ioutil.ReadFile ... into a
+file using go1.21") is not a finding: the inliner refuses std callees until
+the file's go line reaches the toolchain's, so the catalogue reports those
+calls with their real minimum, and an `inline` finding on a line one of the
+`INLINE_RULES` matched is dropped. A raised-only `inline` finding whose base
+pass refused the same std call as "declared using go1.<toolchain minor>"
+(the callee's import path is in `go list std`, read once per scan; only if
+that fails, a path with no dot in its first element) is `modern` `high`, its
+message ending in "std replacement exists;
+go fix applies it once the go line reaches 1.<minor>", and is never stepped.
+When the `go` line is below the toolchain's minor, a second copy gets
+`go <toolchain version>` (`go 1.27.4`, the go.work too) without its
+`toolchain` line and runs the same passes (with `-mod=mod` unless the module
+is vendored or in a workspace). Findings that only it shows (compared by
+file, line, column, analyzer and message) are `needs-newer` with
+`upgrade.pin` `go.mod go`; `to` is the first minor whose `go` line shows
+them, found by vetting only their packages at each minor in between (if the
+time budget runs out there, the rest keep the toolchain's minor and a note
+says so; the stack still ends as `error` on purpose, because the needs-newer
+check did not finish). Every go call gets `GOTOOLCHAIN=local`,
+`GOFLAGS=-buildvcs=false` (an empty GOFLAGS falls back to `go env -w
+GOFLAGS`), `GO111MODULE=on`, `NO_COLOR=1`, `GOWORK` as above and explicit
+`GOOS`/`GOARCH` (the host's for the host pass), with the copy as its folder;
+GOPATH, GOMODCACHE, GOPROXY and GOCACHE stay the user's. `--timeout` (default
+600 s) is one budget for all go calls of the stack; when it runs out the stack
+fails and `message` says what was not analysed. `newest` is the larger of the
+toolchain's minor and `NEWEST_GO` (1.27); an older toolchain adds a note.
+
 **ast-grep catalogue** (`rules/*.yml`, `sgconfig.yml`; `metadata.gate/min`
 decide needs-newer, `metadata.confidence` the confidence): C# `new HttpClient()`
 in a method, `DateTime.UtcNow/Now` → `TimeProvider`, `new Random()` →
@@ -256,7 +329,16 @@ in a method, `DateTime.UtcNow/Now` → `TimeProvider`, `new Random()` →
 `Duration::from_secs(x * 60 | x * 3600)` → `from_mins`/`from_hours` (1.91;
 clippy's duration_suboptimal_units only fires on constants) (all high); Python
 `asyncio.gather` → `TaskGroup` (3.11, low); JS/TS axios / node-fetch → global
-`fetch` (low). `JSON.parse(JSON.stringify())` has no rule here because unicorn
+`fetch` (low); Go (`metadata.gate: go`, read from go.mod) `ioutil.ReadAll/
+ReadFile/WriteFile/NopCloser/TempFile/TempDir` → `io`/`os` and
+`ioutil.Discard` → `io.Discard` (1.16), `reflect.Ptr/PtrTo` →
+`Pointer/PointerTo` (1.18), `importer.For` → `importer.ForCompiler` (1.12),
+`types.NewSignature` → `types.NewSignatureType` (1.18),
+`sort.Strings/Ints/Float64s` → `slices.Sort`
+(1.21), a loop that deletes every map key → `clear` (1.21; not matched when
+the loop body holds a comment) (all high), `ioutil.ReadDir` → `os.ReadDir`
+(1.16) and `import "math/rand"` → `math/rand/v2` (1.22) (both low).
+`JSON.parse(JSON.stringify())` has no rule here because unicorn
 prefer-structured-clone already reports it.
 
 ## Tool home
@@ -269,8 +351,9 @@ the executable's folder.
 
 External tools are looked up on `PATH`, then in the usual install folders:
 `~/.local/bin` (ruff, ast-grep), `~/.cargo/bin` (cargo, rustc, ast-grep), and
-on Windows `%ProgramFiles%` (git, dotnet, node, pwsh), elsewhere
-`~/.dotnet`, `/usr/share/dotnet`, `/opt/microsoft/powershell/7`, `/usr/bin`.
+on Windows `%ProgramFiles%` (git, dotnet, node, pwsh, go), elsewhere
+`~/.dotnet`, `/usr/share/dotnet`, `/opt/microsoft/powershell/7`, `/usr/bin`,
+`/usr/local/go/bin`, `/usr/lib/go/bin`.
 
 ## Cache
 
@@ -289,8 +372,9 @@ PSScriptAnalyzer (`[sha256]` holds the SHA-256 of every download), and the npm s
 typescript, @eslint/css, stylelint, stylelint-plugin-use-baseline), which must
 equal `js/package.json` (a test checks this). `modern-tara --version` prints a
 `warning:` line for each pinned tool whose installed version differs or is
-missing; the exit code stays 0. Rust, .NET, Node, git and pwsh come from the
-machine.
+missing; the exit code stays 0. Rust, .NET, Node, git, pwsh and Go come from the
+machine (`go fix`'s cmd/fix ships with the Go toolchain, so there is no
+x/tools pin).
 
 Install or repair the set for the current user (both scripts read
 `tools.toml` and leave a tool alone when it is already at its version):
@@ -320,9 +404,14 @@ To move a pin: edit `tools.toml` (and, for npm, the exact versions in
 - uses: actions/checkout@<sha> # fetch-depth 0 saves the action an unshallow fetch
   with:
     fetch-depth: 0
-- uses: bingoweb/modern-tara@v0.2.0
+# Only for the Go stack: Go 1.26 or newer, else that stack is skipped.
+- uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
   with:
-    args: --stacks rust,python
+    go-version: "1.27.4"
+    cache: false
+- uses: bingoweb/modern-tara@v0.3.0
+  with:
+    args: --stacks rust,python,go
 ```
 
 Inputs: `version` (a release tag; default the tag the action is used at),
@@ -340,7 +429,9 @@ build provenance with `gh attestation verify <zip> --repo bingoweb/modern-tara`
 and then its SHA-256 against the release's `SHA256SUMS`, runs the install
 script, then `modern-tara scan --repo . --range <range> --gate` and writes the
 stderr summary to the job summary. Output `report` is the JSON report's path.
-Rust, .NET and pwsh come from the runner.
+Rust, .NET, Go and pwsh come from the runner. The Go stack needs
+`actions/setup-go` with Go 1.26 or newer before this step (as above); a
+runner's preinstalled older Go makes the stack `skipped`.
 
 ## Timings
 
@@ -356,6 +447,11 @@ run, "warm" the second.
 | a Python + PowerShell tool, 10 commits | python, powershell | 2 + 2 | 11.9 s | 7.4 s |
 | a JS course repository, 10 commits (`--git-safe`) | js | 39 | 6.0 s | 5.9 s |
 | the Tauri app, last 10 TS commits | js (TS), css | 25 + 3 | 8.9 s | 7.9 s |
+| a Go service (go 1.26.0, one module), `--all-lines` | go | 166 | 35.9 s | 24.2 s |
+| the Go service, last 5 `.go` commits | go | 20 | – | 23.1 s |
+
+The Go rows ran while other programs kept the CPU near 100%, with a warm
+module cache; each scan made a host, a GOOS=linux and a raised-copy `go vet`.
 
 C# warm is not faster: both `dotnet format` passes reload the workspace on
 every run. When the cold Tauri compile ran at the same time, the C# scan took
@@ -369,6 +465,9 @@ children:
 - css: 120 s
 - powershell: 180 s
 - python: up to 9 ruff runs × 120 s (each normally under 0.2 s)
+- go: 600 s for the whole stack (per module, a `go list` and a `go vet` for
+  each GOOS pass, up to 4, the same vet passes on the raised copy, and one
+  vet per GOOS and minor in between, all from one budget)
 
 The ast-grep pass adds up to 60 s on every stack.
 
