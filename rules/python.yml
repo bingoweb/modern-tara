@@ -1,0 +1,12 @@
+# Python catalogue rules. metadata.gate/min: the requires-python that has it.
+# metadata.confidence: high = exact pattern, low = heuristic (never stops --gate).
+id: python-asyncio-gather
+language: python
+severity: info
+message: "`asyncio.gather(...)`: prefer `asyncio.TaskGroup` (Python 3.11), which cancels the other tasks when one fails."
+metadata:
+  gate: requires-python
+  min: "3.11"
+  confidence: low
+rule:
+  pattern: asyncio.gather($$$ARGS)

@@ -1,0 +1,142 @@
+name: modern-tara
+description: Runs modern-tara on the changed lines and stops only on high-confidence modern findings.
+
+inputs:
+  version:
+    description: Release tag of modern-tara to run, such as v0.2.0. Default is the tag this action is used at.
+    required: false
+    default: ""
+  range:
+    description: Commits to compare as <a>..<b>. Default is the pull request's merge base..head, else github.event.before..github.sha.
+    required: false
+    default: ""
+  args:
+    description: More arguments for `modern-tara scan`, split on spaces (for example `--stacks rust,python`).
+    required: false
+    default: ""
+
+outputs:
+  report:
+    description: Path of the JSON report.
+    value: ${{ steps.scan.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Runner check
+      shell: pwsh
+      run: |
+        if ($env:RUNNER_ARCH -ne 'X64' -or $env:RUNNER_OS -notin 'Windows', 'Linux') {
+          throw "modern-tara: releases exist for Windows and Linux x64 runners only; this runner is $($env:RUNNER_OS) $($env:RUNNER_ARCH)"
+        }
+
+    # The ESLint and stylelint set needs Node 26; it stays on PATH for later steps.
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: "26"
+        package-manager-cache: false
+
+    - name: Download and verify modern-tara
+      id: download
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        MT_VERSION: ${{ inputs.version }}
+        MT_ACTION_REF: ${{ github.action_ref }}
+        MT_ACTION_REPO: ${{ github.action_repository }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $version = if ($env:MT_VERSION) { $env:MT_VERSION } elseif ($env:MT_ACTION_REF) { $env:MT_ACTION_REF } else { Split-Path -Leaf $env:GITHUB_ACTION_PATH }
+        if ($version -notmatch '^v\d') { throw "modern-tara: set the version input to a release tag (v...); got '$version'" }
+        $repo = if ($env:MT_ACTION_REPO) { $env:MT_ACTION_REPO } else { 'bingoweb/modern-tara' }
+        $target, $exe = if ($IsWindows) { 'x86_64-pc-windows-msvc', 'modern-tara.exe' } else { 'x86_64-unknown-linux-gnu', 'modern-tara' }
+        $dir = Join-Path $env:RUNNER_TEMP "modern-tara-$version"
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $zip = Join-Path $dir "modern-tara-$target.zip"
+        $base = "https://github.com/$repo/releases/download/$version"
+        $sumsFile = Join-Path $dir 'SHA256SUMS'
+        Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sumsFile -MaximumRetryCount 3
+        Invoke-WebRequest -Uri "$base/modern-tara-$target.zip" -OutFile $zip -MaximumRetryCount 3
+        # The build provenance first: the zip must come from this repository's release workflow.
+        & gh attestation verify $zip --repo bingoweb/modern-tara
+        if ($LASTEXITCODE -ne 0) { throw "modern-tara: modern-tara-$target.zip has no valid build attestation from bingoweb/modern-tara" }
+        $line = Get-Content -LiteralPath $sumsFile | Where-Object { $_ -match "^([0-9a-f]{64})\s+\*?modern-tara-$target\.zip\s*$" } | Select-Object -First 1
+        if (-not $line) { throw "modern-tara: SHA256SUMS has no line for modern-tara-$target.zip" }
+        $want = ($line -split '\s+')[0]
+        $got = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($got -ne $want) { throw "modern-tara: SHA-256 of modern-tara-$target.zip is $got, SHA256SUMS says $want" }
+        $app = Join-Path $dir 'app'
+        Expand-Archive -LiteralPath $zip -DestinationPath $app -Force
+        if (-not $IsWindows) { & chmod 0755 (Join-Path $app $exe) }
+        "home=$app" >> $env:GITHUB_OUTPUT
+        "exe=$(Join-Path $app $exe)" >> $env:GITHUB_OUTPUT
+
+    - name: Install the pinned tools
+      shell: pwsh
+      env:
+        MT_HOME: ${{ steps.download.outputs.home }}
+      run: |
+        if ($IsWindows) {
+          & (Join-Path $env:MT_HOME 'scripts' 'install-tools.ps1')
+        } else {
+          bash (Join-Path $env:MT_HOME 'scripts' 'install-tools.sh')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        }
+        Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $HOME '.local' 'bin')
+
+    - name: Scan
+      id: scan
+      shell: pwsh
+      env:
+        MT_EXE: ${{ steps.download.outputs.exe }}
+        MODERN_TARA_HOME: ${{ steps.download.outputs.home }}
+        MT_RANGE: ${{ inputs.range }}
+        MT_ARGS: ${{ inputs.args }}
+        MT_PR_BASE: ${{ github.event.pull_request.base.sha }}
+        MT_PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        MT_BEFORE: ${{ github.event.before }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        if ($env:MT_RANGE) {
+          $scope = @('--range', $env:MT_RANGE)
+        } else {
+          # Merge bases and older revisions need the history.
+          if ((git rev-parse --is-shallow-repository) -eq 'true') { git fetch --no-tags --quiet --unshallow origin }
+          if ($env:MT_PR_BASE -and $env:MT_PR_HEAD) {
+            git fetch --no-tags --quiet origin $env:MT_PR_BASE $env:MT_PR_HEAD
+            $mergeBase = git merge-base $env:MT_PR_BASE $env:MT_PR_HEAD
+            if ($LASTEXITCODE -ne 0 -or -not $mergeBase) { throw 'modern-tara: no merge base between the pull request base and head' }
+            $scope = @('--range', "$mergeBase..$($env:MT_PR_HEAD)")
+          } else {
+            $sha = $env:GITHUB_SHA
+            $from = $null
+            $before = $env:MT_BEFORE
+            if ($before -and $before -notmatch '^0+$') {
+              git cat-file -e "$before^{commit}" 2>$null
+              if ($LASTEXITCODE -ne 0) {
+                # Force-pushed away: fetch that one commit if GitHub still has it.
+                git fetch --no-tags --quiet origin $before 2>$null
+                git cat-file -e "$before^{commit}" 2>$null
+              }
+              if ($LASTEXITCODE -eq 0) { $from = $before }
+            }
+            if (-not $from) {
+              # A new branch, or `before` is gone: the last commit only.
+              git rev-parse --verify --quiet "$sha~1^{commit}" *> $null
+              if ($LASTEXITCODE -eq 0) { $from = "$sha~1" }
+            }
+            # A root commit: every tracked file is a changed file.
+            $scope = if ($from) { @('--range', "$from..$sha") } else { @('--all-lines') }
+          }
+        }
+        $report = Join-Path $env:RUNNER_TEMP 'modern-tara.json'
+        $summary = Join-Path $env:RUNNER_TEMP 'modern-tara-summary.txt'
+        $extra = @($env:MT_ARGS -split '\s+' | Where-Object { $_ })
+        & $env:MT_EXE scan --repo . @scope --gate --json $report @extra 2> $summary
+        $code = $LASTEXITCODE
+        $text = [string](Get-Content -LiteralPath $summary -Raw -Encoding utf8)
+        [Console]::Error.Write($text)
+        Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value ("``````text`n" + $text.TrimEnd() + "`n``````")
+        "report=$report" >> $env:GITHUB_OUTPUT
+        exit $code

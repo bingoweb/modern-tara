@@ -1,0 +1,4 @@
+# LF everywhere: the shell scripts must stay LF, and fixtures keep exact bytes.
+* text=auto eol=lf
+*.exe binary
+*.zip binary

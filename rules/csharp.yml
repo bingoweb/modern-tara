@@ -1,0 +1,48 @@
+# C# catalogue rules. metadata.gate/min: the TargetFramework that has the
+# modern construct; older frameworks make the finding needs-newer.
+# metadata.confidence: high = exact pattern, low = heuristic (never stops --gate).
+id: csharp-httpclient-per-call
+language: csharp
+severity: info
+message: "`new HttpClient()` inside a method opens a new connection pool per call; use IHttpClientFactory (.NET Core 2.1) or one shared HttpClient with SocketsHttpHandler.PooledConnectionLifetime (.NET Core 2.1)."
+metadata:
+  gate: TargetFramework
+  min: "netcoreapp2.1"
+  confidence: low
+rule:
+  pattern: new HttpClient($$$ARGS)
+  inside:
+    any:
+      - kind: method_declaration
+      - kind: local_function_statement
+      - kind: lambda_expression
+      - kind: accessor_declaration
+    stopBy: end
+---
+id: csharp-datetime-now
+language: csharp
+severity: hint
+message: "`DateTime.UtcNow`/`DateTime.Now` read the system clock directly; inject `TimeProvider` (.NET 8) to make time testable. Low confidence: fine where testability does not matter."
+metadata:
+  gate: TargetFramework
+  min: "net8.0"
+  confidence: low
+rule:
+  any:
+    - pattern: DateTime.UtcNow
+    - pattern: DateTime.Now
+    - pattern: System.DateTime.UtcNow
+    - pattern: System.DateTime.Now
+---
+id: csharp-new-random
+language: csharp
+severity: info
+message: "`new Random()` per use; use the thread-safe shared `Random.Shared` (.NET 6)."
+metadata:
+  gate: TargetFramework
+  min: "net6.0"
+  confidence: low
+rule:
+  any:
+    - pattern: new Random()
+    - pattern: new System.Random()

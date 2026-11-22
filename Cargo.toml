@@ -1,0 +1,24 @@
+[package]
+name = "modern-tara"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+description = "Finds old constructs on the changed lines of a repository, per stack, and says which ones need a newer toolchain or pin."
+license = "MIT"
+repository = "https://github.com/bingoweb/modern-tara"
+
+[dependencies]
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

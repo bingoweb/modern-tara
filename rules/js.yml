@@ -1,0 +1,58 @@
+# JS/TS catalogue rules. metadata.gate/min: the engines.node that has it.
+# metadata.confidence: high = exact pattern, low = heuristic (never stops --gate).
+id: javascript-http-client-package
+language: javascript
+severity: info
+message: "axios / node-fetch: Node has a built-in global `fetch` (since Node 18, stable in Node 21); no package needed."
+metadata:
+  gate: engines.node
+  min: "18"
+  confidence: low
+rule:
+  any:
+    - pattern: require("axios")
+    - pattern: require('axios')
+    - pattern: require("node-fetch")
+    - pattern: require('node-fetch')
+    - kind: import_statement
+      has:
+        field: source
+        regex: ^.(axios|node-fetch).$
+---
+id: typescript-http-client-package
+language: typescript
+severity: info
+message: "axios / node-fetch: Node has a built-in global `fetch` (since Node 18, stable in Node 21); no package needed."
+metadata:
+  gate: engines.node
+  min: "18"
+  confidence: low
+rule:
+  any:
+    - pattern: require("axios")
+    - pattern: require('axios')
+    - pattern: require("node-fetch")
+    - pattern: require('node-fetch')
+    - kind: import_statement
+      has:
+        field: source
+        regex: ^.(axios|node-fetch).$
+---
+id: tsx-http-client-package
+language: tsx
+severity: info
+message: "axios / node-fetch: Node has a built-in global `fetch` (since Node 18, stable in Node 21); no package needed."
+metadata:
+  gate: engines.node
+  min: "18"
+  confidence: low
+rule:
+  any:
+    - pattern: require("axios")
+    - pattern: require('axios')
+    - pattern: require("node-fetch")
+    - pattern: require('node-fetch')
+    - kind: import_statement
+      has:
+        field: source
+        regex: ^.(axios|node-fetch).$

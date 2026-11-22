@@ -1,0 +1,11 @@
+[package]
+name = "fixture-rust"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+
+[[bin]]
+name = "tool"
+path = "src/bin/tool.rs"
+
+[dependencies]

@@ -1,0 +1,6 @@
+{
+  "name": "fixture-js",
+  "private": true,
+  "type": "commonjs",
+  "engines": { "node": ">=18" }
+}

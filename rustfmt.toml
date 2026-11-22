@@ -1,0 +1,3 @@
+# The repository's layout: long single-line expressions, wrapped at 160.
+max_width = 160
+use_small_heuristics = "Max"

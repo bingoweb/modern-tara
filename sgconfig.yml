@@ -1,0 +1,3 @@
+# ast-grep project file for modern-tara's catalogue rules (rules/*.yml).
+ruleDirs:
+  - rules

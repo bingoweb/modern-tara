@@ -1,0 +1,10 @@
+a { color: rgba(0, 0, 0, 0.5); } /* UNCHANGED */
+b { color: rgba(0, 0, 0, 0.5); } /* OLD:color-function-notation:modern */
+c { color: rgb(0 0 0 / 50%); } /* DECOY */
+d { -webkit-transition: color 1s; } /* OLD:property-no-vendor-prefix:modern */
+e { text-wrap: balance; } /* OLD:use-baseline:baseline */
+f { display: flex; } /* DECOY */
+g { margin-left: 1px; } /* OLD:prefer-logical-properties:modern */
+h { margin-inline-start: 1px; } /* DECOY */
+i { margin-block-start: 1px; margin-block-end: 1px; } /* OLD:declaration-block-no-redundant-longhand-properties:modern */
+j { list-style-type: disc; list-style-position: inside; list-style-image: none; } /* DECOY */

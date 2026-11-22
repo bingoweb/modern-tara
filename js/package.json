@@ -1,0 +1,19 @@
+{
+  "name": "modern-tara-js",
+  "private": true,
+  "type": "module",
+  "description": "Pinned ESLint and stylelint set that modern-tara runs on changed JS, TS and CSS files.",
+  "engines": {
+    "node": ">=26"
+  },
+  "devDependencies": {
+    "@eslint/css": "2.0.1",
+    "eslint": "10.15.0",
+    "eslint-plugin-es-x": "10.1.0",
+    "eslint-plugin-unicorn": "80.0.0",
+    "stylelint": "17.16.0",
+    "stylelint-plugin-use-baseline": "1.4.8",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.73.0"
+  }
+}

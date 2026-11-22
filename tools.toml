@@ -1,0 +1,33 @@
+# The exact version of every external tool modern-tara runs.
+# `modern-tara --version` warns when an installed version differs;
+# scripts/install-tools.ps1 and scripts/install-tools.sh install these.
+# Rust, .NET, Node, git and pwsh come from the machine and are not pinned here.
+
+[tools]
+ruff = "0.17.6"
+ast-grep = "0.51.3"
+PSScriptAnalyzer = "1.25.0"
+
+# SHA-256 of every download the install scripts verify, by file name:
+# ruff and ast-grep release assets (github.com/astral-sh/ruff/releases/tag/0.17.6,
+# github.com/ast-grep/ast-grep/releases/tag/0.51.3) and the PowerShell Gallery
+# package (www.powershellgallery.com/api/v2/package/PSScriptAnalyzer/1.25.0).
+# Moving a version above means new hashes here.
+[sha256]
+"ruff-x86_64-pc-windows-msvc.zip" = "00c5d5793d308e8575b16b7303527110dd49bd02d46db0a8668b0eefdca14c2e"
+"ruff-x86_64-unknown-linux-gnu.tar.gz" = "94b33791f48cd54ab35ad673a443a5c001d3e6d87effeaba9899070b700d45f3"
+"app-x86_64-pc-windows-msvc.zip" = "1f27ff60ee033bdfe5d7ea781a869e410b2d882d6c84a6afea8280fc4bbf0716"
+"app-x86_64-unknown-linux-gnu.zip" = "22803eb0c5bf83164fb7fd76d4721d355ecf0c8466ef47342c1ec7d80897ca47"
+"PSScriptAnalyzer.1.25.0.nupkg" = "14e634c828eb98efb9f40b2918ba90f139ed5eccdf663a2a747736d996995d60"
+
+# The same exact versions as js/package.json devDependencies (a test checks
+# this); `npm ci --ignore-scripts` in js/ installs them from js/package-lock.json.
+[npm]
+"@eslint/css" = "2.0.1"
+eslint = "10.15.0"
+eslint-plugin-es-x = "10.1.0"
+eslint-plugin-unicorn = "80.0.0"
+stylelint = "17.16.0"
+stylelint-plugin-use-baseline = "1.4.8"
+typescript = "6.0.3"
+typescript-eslint = "8.73.0"

@@ -1,0 +1,47 @@
+# Rust catalogue rules. metadata.gate/min: the rust-version that has the API.
+# metadata.confidence: high = exact pattern, low = heuristic (never stops --gate).
+id: rust-strip-unwrap-or-trim
+language: rust
+severity: info
+message: "`strip_prefix(p).unwrap_or(s)` / `strip_suffix(p).unwrap_or(s)`: use `str::trim_prefix` / `str::trim_suffix` (Rust 1.100)."
+metadata:
+  gate: rust-version
+  min: "1.100"
+  confidence: high
+rule:
+  any:
+    - pattern: $S.strip_prefix($P).unwrap_or($S)
+    - pattern: $S.strip_suffix($P).unwrap_or($S)
+    - pattern: $S.strip_prefix($P).unwrap_or(&$S)
+    - pattern: $S.strip_suffix($P).unwrap_or(&$S)
+---
+id: rust-oncelock-static-lazylock
+language: rust
+severity: info
+message: "`static X: OnceLock<T>` filled by `get_or_init`: use `std::sync::LazyLock` (Rust 1.80), which initializes on first access."
+metadata:
+  gate: rust-version
+  min: "1.80"
+  confidence: high
+rule:
+  kind: static_item
+  has:
+    field: type
+    regex: "^(std::sync::)?OnceLock<"
+---
+id: rust-duration-from-mins-hours
+language: rust
+severity: info
+message: "`Duration::from_secs(x * 60)` / `(x * 3600)`: use `Duration::from_mins` / `Duration::from_hours` (Rust 1.91)."
+metadata:
+  gate: rust-version
+  min: "1.91"
+  confidence: high
+rule:
+  any:
+    - pattern: Duration::from_secs($X * 60)
+    - pattern: Duration::from_secs(60 * $X)
+    - pattern: Duration::from_secs($X * 3600)
+    - pattern: Duration::from_secs(3600 * $X)
+    - pattern: std::time::Duration::from_secs($X * 60)
+    - pattern: std::time::Duration::from_secs($X * 3600)

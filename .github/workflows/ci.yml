@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          package-manager-cache: false
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: "10.0.x"
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.100 --profile minimal --component clippy,rustfmt
+          rustup default 1.100
+      # The integration tests run every stack whose tool is installed.
+      - name: Install the pinned tools (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/install-tools.ps1
+      - name: Install the pinned tools (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/install-tools.sh
+      - name: Tool folder on PATH
+        shell: pwsh
+        run: Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $HOME '.local' 'bin')
+      - name: Tool versions
+        shell: bash
+        run: cargo run --quiet --locked -- --version
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
