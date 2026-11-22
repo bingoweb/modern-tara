@@ -82,7 +82,9 @@ fn git_exe() -> Option<PathBuf> {
 
 fn scan(o: &cli::Opts) -> Result<i32, String> {
     let started = Instant::now();
-    let dir = std::path::absolute(&o.repo).map_err(|e| format!("{}: {e}", o.repo.display()))?;
+    // The long, real-case form, as git prints the top level: `--repo` under an
+    // 8.3 TEMP (`RUNNER~1`) or in another case must still give the subfolder.
+    let dir = copy::real_path(&std::path::absolute(&o.repo).map_err(|e| format!("{}: {e}", o.repo.display()))?);
     if !dir.is_dir() {
         return Err(format!("{}: not a folder", dir.display()));
     }
@@ -248,7 +250,10 @@ fn select(change: &Change, patterns: &[String], prefix: &str, dir: &Path) -> Res
     for raw in patterns {
         let mut p = raw.replace('\\', "/");
         if Path::new(raw).is_absolute() {
-            p = change::strip_dir(&p, &dir_text).ok_or_else(|| format!("--files {raw}: outside {}", dir.display()))?;
+            let real = copy::real_path(Path::new(raw)).to_string_lossy().replace('\\', "/");
+            p = change::strip_dir(&real, &dir_text)
+                .or_else(|| change::strip_dir(&p, &dir_text))
+                .ok_or_else(|| format!("--files {raw}: outside {}", dir.display()))?;
         }
         let p = p.trim_start_matches("./");
         let full = if prefix.is_empty() { p.to_string() } else { format!("{prefix}/{p}") };

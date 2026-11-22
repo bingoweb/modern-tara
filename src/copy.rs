@@ -1,4 +1,4 @@
-//! The run's scratch folder `%TEMP%\modern-tara-<pid>-<n>`: removed when the
+//! The run's scratch folder `<temp>/modern-tara-<pid>-<n>`: removed when the
 //! guard drops (normal exit, error, panic). A run killed outright cannot clean
 //! up, so each run holds an exclusive lock file and later runs remove folders
 //! whose lock is free.
@@ -19,7 +19,9 @@ pub struct TempRoot {
 
 impl TempRoot {
     pub fn create() -> Result<TempRoot, String> {
-        let base = std::env::temp_dir();
+        // The long form: git and dotnet print long names even when TEMP holds
+        // an 8.3 short name (`RUNNER~1`).
+        let base = real_path(&std::env::temp_dir());
         sweep(&base, Duration::from_secs(60));
         for _ in 0..100 {
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -108,9 +110,51 @@ fn is_run_folder(name: &str) -> bool {
     digits(pid) && digits(n)
 }
 
+/// `p` as the file system names it: 8.3 short names (`RUNNER~1`) expanded,
+/// the real letter case, symlinks resolved, and no `\\?\` prefix, so it
+/// matches the paths git, dotnet and the other tools print. Unchanged when
+/// `p` does not exist.
+pub fn real_path(p: &Path) -> PathBuf {
+    let Ok(real) = fs::canonicalize(p) else { return p.to_path_buf() };
+    if cfg!(windows) {
+        let text = real.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\")
+            && rest.as_bytes().get(1) == Some(&b':')
+        {
+            return PathBuf::from(rest);
+        }
+    }
+    real
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GitHub's Windows runners set TEMP to an 8.3 path (`RUNNER~1`) while
+    /// git and dotnet print the long one; both must give the same path.
+    #[cfg(windows)]
+    #[test]
+    fn real_path_expands_short_names_and_fixes_case() {
+        use std::os::windows::process::CommandExt;
+        let long = std::env::temp_dir().join(format!("mt-long-folder-name-{}", std::process::id()));
+        fs::create_dir_all(&long).unwrap();
+        let real = real_path(&long);
+        assert!(!real.to_string_lossy().starts_with(r"\\?\"), "{}", real.display());
+        assert!(real.ends_with(long.file_name().unwrap()), "{}", real.display());
+        assert_eq!(real_path(&PathBuf::from(long.to_string_lossy().to_uppercase())), real);
+        let out = std::process::Command::new("cmd").raw_arg(format!("/d /c for %I in (\"{}\") do @echo %~sI", long.display())).output().unwrap();
+        let short = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        if short.is_dir() {
+            assert_eq!(real_path(&short), real, "short name {}", short.display());
+        }
+        let missing = long.join("missing");
+        assert_eq!(real_path(&missing), missing);
+        let _ = fs::remove_dir_all(&long);
+    }
 
     #[test]
     fn sweep_only_matches_run_folders() {
