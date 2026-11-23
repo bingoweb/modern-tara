@@ -8,3 +8,7 @@ g { margin-left: 1px; } /* OLD:prefer-logical-properties:modern */
 h { margin-inline-start: 1px; } /* DECOY */
 i { margin-block-start: 1px; margin-block-end: 1px; } /* OLD:declaration-block-no-redundant-longhand-properties:modern */
 j { list-style-type: disc; list-style-position: inside; list-style-image: none; } /* DECOY */
+k { width: 10px; height: 100vh; top: 0; max-width: 50vw; } /* DECOY */
+l { text-align: right; } /* OLD:prefer-logical-properties:modern */
+m { padding-right: 1px; border-left-width: 1px; right: 0; } /* OLD:prefer-logical-properties:modern */
+n { float: left; } /* OLD:prefer-logical-properties:modern */

@@ -23,11 +23,115 @@ metadata:
   gate: rust-version
   min: "1.80"
   confidence: high
+# Only a static that the file fills with get_or_init and never .set()s
+# (or try_inserts): a runtime-initialised OnceLock is right as it is. High only
+# when no such call sits in a function with parameters (the closure may capture
+# them, which LazyLock cannot): the -captures twin below is low.
+utils:
+  called-on-the-static:
+    kind: field_expression
+    has:
+      field: value
+      any:
+        - pattern: $NAME
+        - has: { field: name, pattern: $NAME }
+  called-in-fn-with-params:
+    kind: field_expression
+    all:
+      - has: { field: field, regex: "^get_or_init$" }
+      - inside:
+          kind: function_item
+          stopBy: end
+          has:
+            field: parameters
+            has:
+              any: [{ kind: parameter }, { kind: self_parameter }]
 rule:
   kind: static_item
-  has:
-    field: type
-    regex: "^(std::sync::)?OnceLock<"
+  all:
+    - has: { field: type, regex: "^(std::sync::)?OnceLock<" }
+    - has: { field: name, pattern: $NAME }
+    - inside:
+        kind: source_file
+        stopBy: end
+        has:
+          stopBy: end
+          kind: field_expression
+          all:
+            - has: { field: field, regex: "^get_or_init$" }
+            - matches: called-on-the-static
+    - not:
+        inside:
+          kind: source_file
+          stopBy: end
+          has:
+            stopBy: end
+            kind: field_expression
+            all:
+              - has: { field: field, regex: "^(set|try_insert)$" }
+              - matches: called-on-the-static
+    - not:
+        inside:
+          kind: source_file
+          stopBy: end
+          has:
+            stopBy: end
+            kind: field_expression
+            all:
+              - matches: called-on-the-static
+              - matches: called-in-fn-with-params
+---
+id: rust-oncelock-static-lazylock-captures
+language: rust
+severity: info
+message: "`static X: OnceLock<T>` filled by `get_or_init` in a function with parameters: `std::sync::LazyLock` (Rust 1.80) fits only if the closure captures none of them."
+metadata:
+  gate: rust-version
+  min: "1.80"
+  confidence: low
+utils:
+  called-on-the-static:
+    kind: field_expression
+    has:
+      field: value
+      any:
+        - pattern: $NAME
+        - has: { field: name, pattern: $NAME }
+  called-in-fn-with-params:
+    kind: field_expression
+    all:
+      - has: { field: field, regex: "^get_or_init$" }
+      - inside:
+          kind: function_item
+          stopBy: end
+          has:
+            field: parameters
+            has:
+              any: [{ kind: parameter }, { kind: self_parameter }]
+rule:
+  kind: static_item
+  all:
+    - has: { field: type, regex: "^(std::sync::)?OnceLock<" }
+    - has: { field: name, pattern: $NAME }
+    - inside:
+        kind: source_file
+        stopBy: end
+        has:
+          stopBy: end
+          kind: field_expression
+          all:
+            - matches: called-on-the-static
+            - matches: called-in-fn-with-params
+    - not:
+        inside:
+          kind: source_file
+          stopBy: end
+          has:
+            stopBy: end
+            kind: field_expression
+            all:
+              - has: { field: field, regex: "^(set|try_insert)$" }
+              - matches: called-on-the-static
 ---
 id: rust-duration-from-mins-hours
 language: rust
@@ -37,11 +141,14 @@ metadata:
   gate: rust-version
   min: "1.91"
   confidence: high
+# Only `Duration::from_secs` (or `std::time::Duration::from_secs`) of a
+# product with the literal 60 or 3600; any other `x * 60` is left alone.
 rule:
   any:
-    - pattern: Duration::from_secs($X * 60)
-    - pattern: Duration::from_secs(60 * $X)
-    - pattern: Duration::from_secs($X * 3600)
-    - pattern: Duration::from_secs(3600 * $X)
-    - pattern: std::time::Duration::from_secs($X * 60)
-    - pattern: std::time::Duration::from_secs($X * 3600)
+    - pattern: $F($X * 60)
+    - pattern: $F(60 * $X)
+    - pattern: $F($X * 3600)
+    - pattern: $F(3600 * $X)
+constraints:
+  F:
+    regex: "^(std::time::)?Duration::from_secs$"

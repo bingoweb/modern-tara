@@ -1,0 +1,5 @@
+@import "tailwindcss" source(none);
+@custom-variant dark (&:is(.dark *));
+a { color: red; }
+.b { width: if(style(--wide: 1): 10px; else: 5px); }
+.c { margin-left: 1px; } /* OLD:prefer-logical-properties:modern */

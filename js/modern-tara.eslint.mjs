@@ -99,7 +99,8 @@ export function buildConfig(root, files) {
   }
   const config = [
     {
-      linterOptions: { reportUnusedDisableDirectives: 'off', reportUnusedInlineConfigs: 'off' },
+      // Inline eslint-disable comments never hide a finding: only modern-tara.toml waives.
+      linterOptions: { noInlineConfig: true, reportUnusedDisableDirectives: 'off', reportUnusedInlineConfigs: 'off' },
     },
   ];
   for (const group of groups.values()) {

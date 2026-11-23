@@ -105,6 +105,27 @@ impl Change {
         Ok(found)
     }
 
+    /// The `paths` no stack can copy: missing, unreadable or over
+    /// [`MAX_FILE_BYTES`] (sizes only, no contents read).
+    pub fn unreadable(&self, paths: &[String]) -> Result<Vec<String>, String> {
+        let refs: Vec<&String> = paths.iter().collect();
+        let ok: Vec<&String> = match &self.source {
+            Source::Rev(g, rev) => g.blobs_within(&format!("{rev}:"), &refs, MAX_FILE_BYTES)?,
+            Source::Index(g) => g.blobs_within(":", &refs, MAX_FILE_BYTES)?,
+            Source::WorkTree(_) | Source::Dir => refs
+                .iter()
+                .copied()
+                .filter(|p| {
+                    safe_join(&self.root, p)
+                        .and_then(|full| fs::metadata(full).ok())
+                        .is_some_and(|m| m.is_file() && usize::try_from(m.len()).is_ok_and(|n| n <= MAX_FILE_BYTES))
+                })
+                .collect(),
+        };
+        let ok: std::collections::HashSet<&String> = ok.into_iter().collect();
+        Ok(paths.iter().filter(|p| !ok.contains(p)).cloned().collect())
+    }
+
     pub fn read_text(&self, path: &str) -> Option<String> {
         let mut m = self.read(&[path.to_string()]).ok()?;
         m.remove(path).map(|b| String::from_utf8_lossy(&b).into_owned())

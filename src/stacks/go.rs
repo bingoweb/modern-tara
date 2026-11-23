@@ -13,7 +13,7 @@ use crate::proc::{Cmd, Output};
 use crate::report::{Confidence, Finding, Kind, StackReport, Upgrade};
 use serde_json::Value;
 use std::cell::{Cell, OnceCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -62,6 +62,35 @@ const OTHER_GOOS: [&str; 3] = ["linux", "windows", "darwin"];
 
 /// GOARCH of the cross passes: every GOOS above has it.
 const CROSS_GOARCH: &str = "amd64";
+
+/// For a constraint that only negates (`!windows && !linux && !darwin`,
+/// `!amd64 && !arm64`): the first of these it does not name. Pure-Go ports
+/// with amd64, 386 and arm, so `go vet` cross-checks them with cgo off.
+const FALLBACK_GOOS: [&str; 3] = ["freebsd", "netbsd", "openbsd"];
+const FALLBACK_GOARCH: [&str; 2] = ["386", "arm"];
+
+/// The valid GOOS/GOARCH pairs of the toolchain (`go tool dist list`): `GOARCH`s per `GOOS`.
+type Pairs = BTreeMap<String, Vec<String>>;
+
+/// The GOARCH of a pass that names none: the host's on the host GOOS, else
+/// amd64 when the GOOS has it, else its first GOARCH (js and wasip1: wasm).
+/// Without a pair table (`go tool dist list` failed): amd64.
+fn default_arch(goos: &str, host: (&str, &str), pairs: Option<&Pairs>) -> String {
+    if goos == host.0 {
+        return host.1.to_string();
+    }
+    let archs = pairs.and_then(|p| p.get(goos));
+    archs.filter(|a| !a.iter().any(|x| x == CROSS_GOARCH)).and_then(|a| a.first()).map_or_else(|| CROSS_GOARCH.to_string(), Clone::clone)
+}
+
+/// The first GOARCH of `goos` the constraint does not name, for a constraint
+/// that negates: 386, then arm, then the others in the toolchain's order.
+fn fallback_arch(goos: &str, named: &[&str], pairs: Option<&Pairs>) -> Option<String> {
+    let valid: Vec<String> = pairs.and_then(|p| p.get(goos)).cloned().unwrap_or_else(|| FALLBACK_GOARCH.iter().map(ToString::to_string).collect());
+    let preferred = FALLBACK_GOARCH.iter().map(ToString::to_string).filter(|a| valid.contains(a));
+    let rest = valid.iter().filter(|a| !FALLBACK_GOARCH.contains(&a.as_str())).cloned();
+    preferred.chain(rest).find(|a| !named.contains(&a.as_str()))
+}
 
 /// The upgrade pin of Go findings.
 const PIN: &str = "go.mod go";
@@ -127,6 +156,8 @@ struct Go {
     budget: Budget,
     /// `go list std`, read once when first needed; `None` when it failed.
     std: OnceCell<Option<BTreeSet<String>>>,
+    /// `go tool dist list`, read once when first needed; `None` when it failed.
+    pairs: OnceCell<Option<Pairs>>,
 }
 
 /// Where the go calls of one copy run.
@@ -145,16 +176,42 @@ fn with_env(mut cmd: Cmd) -> Cmd {
 }
 
 impl Go {
-    /// A go call with GOOS, GOARCH and GOWORK pinned and the budget's rest as timeout.
-    fn cmd(&self, site: &Site, goos: &str) -> Result<Cmd, String> {
+    /// The GOARCH of a pass that names none: the host's on the host GOOS, else amd64.
+    fn default_arch(&self, goos: &str) -> String {
+        default_arch(goos, (&self.host_os, &self.host_arch), self.pairs())
+    }
+    /// The GOOS/GOARCH pairs this toolchain builds, from `go tool dist list -json`.
+    fn pairs(&self) -> Option<&Pairs> {
+        self.pairs
+            .get_or_init(|| {
+                let out = with_env(Cmd::new(&self.exe))
+                    .env("GOWORK", "off")
+                    .env_remove("GOOS")
+                    .env_remove("GOARCH")
+                    .args(["tool", "dist", "list", "-json"])
+                    .cwd(&std::env::temp_dir())
+                    .timeout(self.budget.left()?.min(Duration::from_secs(60)))
+                    .run()
+                    .ok()?;
+                let list: Vec<Value> = out.ok().then(|| serde_json::from_slice(&out.stdout).ok()).flatten()?;
+                let mut pairs = Pairs::new();
+                for p in &list {
+                    pairs.entry(p.get("GOOS")?.as_str()?.to_string()).or_default().push(p.get("GOARCH")?.as_str()?.to_string());
+                }
+                Some(pairs)
+            })
+            .as_ref()
+    }
+    /// A go call with GOOS, GOARCH (empty = the default one) and GOWORK pinned and the budget's rest as timeout.
+    fn cmd(&self, site: &Site, goos: &str, arch: &str) -> Result<Cmd, String> {
         let left = self.budget.left().ok_or_else(|| TIMED_OUT.to_string())?;
-        let arch = if goos == self.host_os { self.host_arch.as_str() } else { CROSS_GOARCH };
-        let mut cmd = with_env(Cmd::new(&self.exe)).cwd(&site.cwd).env("GOOS", goos).env("GOARCH", arch).timeout(left);
+        let arch = if arch.is_empty() { self.default_arch(goos) } else { arch.to_string() };
+        let mut cmd = with_env(Cmd::new(&self.exe)).cwd(&site.cwd).env("GOOS", goos).env("GOARCH", &arch).timeout(left);
         cmd = match &site.gowork {
             Some(w) => cmd.env("GOWORK", w),
             None => cmd.env("GOWORK", "off"),
         };
-        if goos != self.host_os {
+        if goos != self.host_os || arch != self.host_arch.as_str() {
             // A cross build has no C compiler for the target.
             cmd = cmd.env("CGO_ENABLED", "0");
         }
@@ -223,10 +280,13 @@ fn disable_flags(names: &[String]) -> Vec<String> {
 }
 
 /// The arguments of one `go vet` run.
-fn vet_args(fix: &Path, off: &[String], mod_mod: bool, patterns: &[String]) -> Vec<String> {
+fn vet_args(fix: &Path, off: &[String], mod_mod: bool, tags: &str, patterns: &[String]) -> Vec<String> {
     let mut args = vec!["vet".to_string()];
     if mod_mod {
         args.push("-mod=mod".into());
+    }
+    if !tags.is_empty() {
+        args.push(format!("-tags={tags}"));
     }
     args.push(format!("-vettool={}", fix.display()));
     args.push("-json".into());
@@ -277,6 +337,7 @@ fn probe(exe: &Path, budget: Budget) -> Result<Go, String> {
         off: disable_flags(&names),
         budget,
         std: OnceCell::new(),
+        pairs: OnceCell::new(),
     })
 }
 
@@ -300,6 +361,8 @@ struct Module {
     wanted: BTreeSet<String>,
     /// The other changed files.
     ignored: Vec<String>,
+    /// The `//go:build` expression of each wanted file that has one.
+    build: BTreeMap<String, String>,
     /// The `go` directive as written; `None` when the line is missing.
     go_text: Option<String>,
     /// `None` when the directive is unreadable.
@@ -365,6 +428,10 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
     if !loose.is_empty() {
         report.note(format!("no go.mod above {} file(s); not analysed.", loose.len()));
     }
+    for f in &loose {
+        report.unscanned(f.clone(), "no go.mod above it: not analysed");
+    }
+    report.ran(ANALYZERS.iter().map(|a| format!("go/{a}")));
 
     let catalogue = catalogue(ctx, &mut report, &modules, &newest);
     let mut not_done: Vec<String> = Vec::new();
@@ -406,6 +473,7 @@ fn catalogue(ctx: &Ctx, report: &mut StackReport, modules: &[Module], newest: &s
     let _ = ctx.change.materialize(&copy, &files);
     match astgrep::scan(ctx, &copy, &files) {
         Ok(Some(matches)) => {
+            report.ran(astgrep::rule_ids(&ctx.home, "go"));
             for m in matches.into_iter().filter(|m| m.gate == "go") {
                 let module = modules.iter().find(|md| md.wanted.contains(&m.file));
                 let have = module.and_then(|md| md.version).map(|v| (v.major, v.minor));
@@ -423,7 +491,7 @@ fn catalogue(ctx: &Ctx, report: &mut StackReport, modules: &[Module], newest: &s
             }
         }
         Ok(None) => report.note("ast-grep not found: catalogue rules skipped."),
-        Err(e) => report.note(e),
+        Err(e) => report.fail(e),
     }
     lines
 }
@@ -445,7 +513,17 @@ fn locate(change: &Change, files: &[String]) -> (Vec<Module>, Vec<String>) {
                 Some(t) => pins::go_version(t),
             };
             let workspace = workspace_for(change, &root);
-            Module { root, go_mod, files: Vec::new(), wanted: BTreeSet::new(), ignored: Vec::new(), go_text: parsed.go, version, workspace }
+            Module {
+                root,
+                go_mod,
+                files: Vec::new(),
+                wanted: BTreeSet::new(),
+                ignored: Vec::new(),
+                build: BTreeMap::new(),
+                go_text: parsed.go,
+                version,
+                workspace,
+            }
         });
         m.files.push(f.clone());
     }
@@ -459,6 +537,9 @@ fn locate(change: &Change, files: &[String]) -> (Vec<Module>, Vec<String>) {
                 m.ignored.push(f.clone());
             } else {
                 m.wanted.insert(f.clone());
+                if let Some(expr) = tag {
+                    m.build.insert(f.clone(), expr);
+                }
             }
         }
     }
@@ -568,6 +649,10 @@ struct Hit {
     message: String,
     /// The GOOS of the pass that found it.
     goos: String,
+    /// Its GOARCH (empty for the default one).
+    arch: String,
+    /// Its build tags (`a,b`; empty for none).
+    tags: String,
 }
 
 impl Hit {
@@ -903,11 +988,26 @@ fn parse_list(stdout: &[u8], copy: &Path) -> Vec<Pkg> {
     out
 }
 
-/// One `go vet` pass: the GOOS and the package patterns.
+/// One `go vet` pass: the GOOS, the GOARCH, the build tags (`a,b`; empty for none) and the package patterns.
 #[derive(Debug, Clone)]
 struct Pass {
     goos: String,
+    /// Empty for the default GOARCH of the GOOS.
+    arch: String,
+    tags: String,
     patterns: Vec<String>,
+}
+
+impl Pass {
+    fn label(&self) -> String {
+        pass_label(&self.goos, &self.arch, &self.tags)
+    }
+}
+
+/// `GOOS=linux`, `GOOS=linux GOARCH=arm64`, or `GOOS=linux -tags a,b`.
+fn pass_label(goos: &str, arch: &str, tags: &str) -> String {
+    let arch = if arch.is_empty() { String::new() } else { format!(" GOARCH={arch}") };
+    if tags.is_empty() { format!("GOOS={goos}{arch}") } else { format!("GOOS={goos}{arch} -tags {tags}") }
 }
 
 #[derive(Default)]
@@ -927,8 +1027,9 @@ struct VetRun {
 fn vet(go: &Go, site: &Site, pass: &Pass, mod_mod: bool) -> Result<VetRun, String> {
     let mut run = VetRun::default();
     // Chunks keep the command line under the Windows limit.
-    for chunk in pass.patterns.chunks(200) {
-        let out = go.run(go.cmd(site, &pass.goos)?.args(vet_args(&go.fix, &go.off, mod_mod, chunk)))?;
+    let fixed = go.cmd(site, &pass.goos, &pass.arch)?.args(vet_args(&go.fix, &go.off, mod_mod, &pass.tags, &[])).line_len();
+    for chunk in crate::proc::chunks(fixed, &pass.patterns) {
+        let out = go.run(go.cmd(site, &pass.goos, &pass.arch)?.args(vet_args(&go.fix, &go.off, mod_mod, &pass.tags, chunk)))?;
         let parsed = parse_vet(&out.stdout);
         let stderr = out.stderr_text();
         let failed = failed_packages(&stderr, &parsed.packages);
@@ -942,12 +1043,12 @@ fn vet(go: &Go, site: &Site, pass: &Pass, mod_mod: bool) -> Result<VetRun, Strin
         }
         if !out.ok() {
             let error = with_hint(&out.tail(3), &stderr);
-            run.notes.push(format!("go vet (GOOS={}) reported errors: {error}", pass.goos));
-            run.errors.push(format!("GOOS={}: {error}", pass.goos));
+            run.notes.push(format!("go vet ({}) reported errors: {error}", pass.label()));
+            run.errors.push(format!("{}: {error}", pass.label()));
         }
         run.failed.extend(failed);
         if let Some(e) = parsed.broken {
-            run.notes.push(format!("go vet JSON (GOOS={}) stopped early: {e}", pass.goos));
+            run.notes.push(format!("go vet JSON ({}) stopped early: {e}", pass.label()));
         }
         run.notes.extend(parsed.errors.into_iter().map(|e| format!("go fix analyzer error: {e}")));
         for d in parsed.diags {
@@ -961,16 +1062,30 @@ fn vet(go: &Go, site: &Site, pass: &Pass, mod_mod: bool) -> Result<VetRun, Strin
                 continue;
             }
             let Some(file) = super::rel_to(&site.copy, &d.path) else { continue };
-            run.hits.push(Hit { file, line: d.line, column: d.column, analyzer: d.analyzer, message: d.message, goos: pass.goos.clone() });
+            run.hits.push(Hit {
+                file,
+                line: d.line,
+                column: d.column,
+                analyzer: d.analyzer,
+                message: d.message,
+                goos: pass.goos.clone(),
+                arch: pass.arch.clone(),
+                tags: pass.tags.clone(),
+            });
         }
     }
     Ok(run)
 }
 
-fn list(go: &Go, site: &Site, goos: &str, patterns: &[String]) -> Result<Vec<Pkg>, String> {
+fn list(go: &Go, site: &Site, (goos, arch, tags): (&str, &str, &str), patterns: &[String]) -> Result<Vec<Pkg>, String> {
     let mut pkgs = Vec::new();
-    for chunk in patterns.chunks(200) {
-        let cmd = go.cmd(site, goos)?.args(["list", "-e", LIST_FIELDS]).args(chunk);
+    let mut head = vec!["list".to_string(), "-e".into(), LIST_FIELDS.into()];
+    if !tags.is_empty() {
+        head.push(format!("-tags={tags}"));
+    }
+    let fixed = go.cmd(site, goos, arch)?.args(&head).line_len();
+    for chunk in crate::proc::chunks(fixed, patterns) {
+        let cmd = go.cmd(site, goos, arch)?.args(&head).args(chunk);
         let out = go.run(cmd)?;
         if !out.ok() {
             return Err(with_hint(&out.tail(4), &out.stderr_text()));
@@ -986,38 +1101,315 @@ struct Base {
     passes: Vec<Pass>,
     blocked: Vec<Refusal>,
     uncovered: BTreeSet<String>,
+    /// Changed files of packages go cannot load, with the reason.
+    unloadable: BTreeMap<String, String>,
+    /// Changed files no pass can compile (constraints no pass meets, or beyond
+    /// the cap on extra passes), with the reason.
+    unreachable: BTreeMap<String, String>,
+    /// Files beyond the cap on extra passes, with the reason: `unreachable` once
+    /// every pass has run and they are still uncovered.
+    over_cap: BTreeMap<String, String>,
     timed_out: bool,
 }
 
+/// Extra (GOOS, tags) passes per module, for files only a build tag or a GOOS
+/// outside the standard passes includes.
+const MAX_EXTRA_PASSES: usize = 3;
+
+/// One planned go list and vet round: `only` limits it to those files.
+struct Round {
+    goos: String,
+    arch: String,
+    tags: String,
+    only: Option<BTreeSet<String>>,
+}
+
+const KNOWN_GOOS: [&str; 18] = [
+    "aix",
+    "android",
+    "darwin",
+    "dragonfly",
+    "freebsd",
+    "hurd",
+    "illumos",
+    "ios",
+    "js",
+    "linux",
+    "nacl",
+    "netbsd",
+    "openbsd",
+    "plan9",
+    "solaris",
+    "wasip1",
+    "windows",
+    "zos",
+];
+
+const KNOWN_GOARCH: [&str; 24] = [
+    "386",
+    "amd64",
+    "amd64p32",
+    "arm",
+    "armbe",
+    "arm64",
+    "arm64be",
+    "loong64",
+    "mips",
+    "mipsle",
+    "mips64",
+    "mips64le",
+    "mips64p32",
+    "mips64p32le",
+    "ppc",
+    "ppc64",
+    "ppc64le",
+    "riscv",
+    "riscv64",
+    "s390",
+    "s390x",
+    "sparc",
+    "sparc64",
+    "wasm",
+];
+
+const UNIX_GOOS: [&str; 12] = ["aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos", "ios", "linux", "netbsd", "openbsd", "solaris"];
+
+/// Whether build tag `tag` holds for `goos`/`arch`: the GOOS (with the ones it
+/// implies), the GOARCH, `unix`, `gc`, `go1.N`; `cgo` and `gccgo` never hold
+/// (cross passes have no C compiler). `None` for a custom tag.
+fn builtin_tag(tag: &str, goos: &str, arch: &str) -> Option<bool> {
+    let implied = match goos {
+        "android" => Some("linux"),
+        "illumos" => Some("solaris"),
+        "ios" => Some("darwin"),
+        _ => None,
+    };
+    Some(match tag {
+        t if KNOWN_GOOS.contains(&t) => t == goos || implied == Some(t),
+        t if KNOWN_GOARCH.contains(&t) => t == arch,
+        "unix" => UNIX_GOOS.contains(&goos),
+        "gc" => true,
+        "cgo" | "gccgo" => false,
+        t if t.strip_prefix("go1.").is_some_and(|n| n.parse::<u32>().is_ok()) => true,
+        _ => return None,
+    })
+}
+
+const CONSTRAINT_OPS: &str = "()!&|";
+
+/// `a && (b || !c)` split into operators and words.
+fn constraint_tokens(expr: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut word = None;
+    for (i, c) in expr.char_indices() {
+        let op = CONSTRAINT_OPS.contains(c);
+        if let Some(start) = word.filter(|_| op || c.is_whitespace()) {
+            out.push(&expr[start..i]);
+            word = None;
+        }
+        if op {
+            out.push(&expr[i..=i]);
+        } else if word.is_none() && !c.is_whitespace() {
+            word = Some(i);
+        }
+    }
+    out.extend(word.map(|s| &expr[s..]));
+    out
+}
+
+/// Evaluates a `//go:build` expression; `tag` says whether a word holds.
+struct Constraint<'a> {
+    tokens: Vec<&'a str>,
+    at: usize,
+    tag: &'a dyn Fn(&str) -> bool,
+}
+
+impl Constraint<'_> {
+    fn eat(&mut self, op: &str) -> bool {
+        let hit = self.tokens.get(self.at) == Some(&op);
+        self.at += usize::from(hit);
+        hit
+    }
+    fn or(&mut self) -> bool {
+        let mut v = self.and();
+        while self.eat("|") {
+            self.eat("|");
+            v |= self.and();
+        }
+        v
+    }
+    fn and(&mut self) -> bool {
+        let mut v = self.not();
+        while self.eat("&") {
+            self.eat("&");
+            v &= self.not();
+        }
+        v
+    }
+    fn not(&mut self) -> bool {
+        if self.eat("!") {
+            return !self.not();
+        }
+        if self.eat("(") {
+            let v = self.or();
+            self.eat(")");
+            return v;
+        }
+        let word = self.tokens.get(self.at).copied();
+        self.at += 1;
+        word.is_some_and(self.tag)
+    }
+}
+
+/// The (GOOS, GOARCH, tags) pass that compiles `name` (a file name): the GOOS and
+/// GOARCH its name asks for, and the fewest custom build tags that satisfy
+/// its `//go:build` expression. The GOARCH is empty when it is the default one
+/// of the GOOS (the host's, else amd64). `Err` says why no pass can (cgo is off).
+fn needs(name: &str, expr: Option<&str>, host: (&str, &str), pairs: Option<&Pairs>) -> Result<(String, String, String), String> {
+    let stem = name.trim_suffix(".go");
+    let parts: Vec<&str> = stem.trim_suffix("_test").split('_').collect();
+    let (mut name_os, mut name_arch) = (None, None);
+    if let [.., prev, last] = parts.as_slice() {
+        if KNOWN_GOARCH.contains(last) {
+            name_arch = Some(*last);
+            name_os = (parts.len() >= 3 && KNOWN_GOOS.contains(prev)).then_some(*prev);
+        } else if KNOWN_GOOS.contains(last) {
+            name_os = Some(*last);
+        }
+    }
+    let words: Vec<&str> = expr.map_or_else(Vec::new, constraint_tokens).into_iter().filter(|t| !t.contains(|c| CONSTRAINT_OPS.contains(c))).collect();
+    let custom: BTreeSet<&str> = words.iter().copied().filter(|w| builtin_tag(w, "", "").is_none()).collect();
+    if custom.len() > 6 {
+        return Err(format!("its build constraint names {} custom tags: too many to combine", custom.len()));
+    }
+    let custom: Vec<&str> = custom.into_iter().collect();
+    let mut masks: Vec<u32> = (0..1 << custom.len()).collect();
+    masks.sort_by_key(|m| m.count_ones());
+    let unix = words.contains(&"unix").then_some("linux");
+    // An expression that negates (`!amd64 && !arm64`) is met by a name it does not mention.
+    let negates = expr.is_some_and(|e| e.contains('!'));
+    let unnamed = |pool: &[&'static str], fits: &dyn Fn(&str) -> bool| negates.then(|| pool.iter().copied().find(|p| !words.contains(p) && fits(p))).flatten();
+    let goos_list: Vec<&str> = name_os.map_or_else(
+        || {
+            std::iter::once(host.0)
+                .chain(words.iter().copied().filter(|w| KNOWN_GOOS.contains(w)))
+                .chain(unix)
+                .chain(unnamed(&FALLBACK_GOOS, &|_| true))
+                .collect()
+        },
+        |os| vec![os],
+    );
+    let mut why = String::new();
+    for goos in goos_list {
+        let default = default_arch(goos, host, pairs);
+        let valid = |a: &str| pairs.is_none_or(|p| p.get(goos).is_some_and(|l| l.iter().any(|x| x == a)));
+        let archs: Vec<String> = name_arch.map_or_else(
+            || {
+                let named: Vec<&str> = words.iter().copied().filter(|w| KNOWN_GOARCH.contains(w)).collect();
+                let fallback = if negates { fallback_arch(goos, &named, pairs) } else { None };
+                std::iter::once(default.clone()).chain(named.into_iter().map(String::from)).chain(fallback).collect()
+            },
+            |a| vec![a.to_string()],
+        );
+        for arch in archs.iter().filter(|a| valid(a)) {
+            for mask in &masks {
+                let on: Vec<&str> = custom.iter().enumerate().filter(|(i, _)| (mask >> i) & 1 == 1).map(|(_, t)| *t).collect();
+                let tag = |t: &str| builtin_tag(t, goos, arch).unwrap_or_else(|| on.contains(&t));
+                if expr.is_none_or(|e| Constraint { tokens: constraint_tokens(e), at: 0, tag: &tag }.or()) {
+                    return Ok((goos.to_string(), if *arch == default { String::new() } else { arch.clone() }, on.join(",")));
+                }
+            }
+        }
+        why = format!("its build constraint `{}` is not met under GOOS={goos} (any GOARCH it names) without cgo", expr.unwrap_or_default());
+    }
+    Err(why)
+}
+
+/// The extra rounds for the files no standard pass compiled: one per
+/// (GOOS, GOARCH, tags) combination, at most `MAX_EXTRA_PASSES`; files no pass can
+/// compile move to `base.unreachable`; those beyond the cap are in `base.over_cap`.
+fn plan_extras(go: &Go, m: &Module, base: &mut Base) -> Vec<Round> {
+    let mut groups: BTreeMap<(String, String, String), BTreeSet<String>> = BTreeMap::new();
+    for f in base.uncovered.clone() {
+        match needs(change::file_name(&f), m.build.get(&f).map(String::as_str), (&go.host_os, &go.host_arch), go.pairs()) {
+            // The standard passes already tried it.
+            Ok((goos, arch, tags)) if arch.is_empty() && tags.is_empty() && (goos == go.host_os || OTHER_GOOS.contains(&goos.as_str())) => {}
+            Ok(combo) => {
+                groups.entry(combo).or_default().insert(f);
+            }
+            Err(why) => {
+                base.uncovered.remove(&f);
+                base.unreachable.insert(f, why);
+            }
+        }
+    }
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by_key(|(key, files)| (std::cmp::Reverse(files.len()), key.clone()));
+    // Files beyond the cap stay uncovered: a pass that runs may still compile them.
+    let beyond = groups.split_off(groups.len().min(MAX_EXTRA_PASSES));
+    for ((goos, arch, tags), files) in beyond {
+        let why = format!("more than {MAX_EXTRA_PASSES} extra (GOOS, GOARCH, tags) passes needed: this one needs {}", pass_label(&goos, &arch, &tags));
+        base.over_cap.extend(files.into_iter().map(|f| (f, why.clone())));
+    }
+    groups.into_iter().map(|((goos, arch, tags), files)| Round { goos, arch, tags, only: Some(files) }).collect()
+}
+
 /// `go list` over `./...` for the host GOOS, then over the folders of the
-/// changed files no earlier pass compiled for linux, windows and darwin;
-/// each pass vets only the packages that hold changed files. `Err` only for
-/// a host pass that could not run, or when no GOOS analysed any changed file
-/// and some failed (a package that type-checks only on Linux is retried there).
+/// changed files no earlier pass compiled for linux, windows and darwin, then
+/// one pass per (GOOS, tags) combination the rest need (`-tags`, another
+/// GOOS; at most `MAX_EXTRA_PASSES`); each pass vets only the packages that
+/// hold changed files. `Err` only for a host pass that could not run, or when
+/// no GOOS analysed any changed file and some failed (a package that
+/// type-checks only on Linux is retried there).
+#[expect(clippy::too_many_lines, reason = "one linear pipeline: rounds, list, vet, bookkeeping")]
 fn base_passes(go: &Go, m: &Module, site: &Site, notes: &mut Vec<String>) -> Result<Base, String> {
-    let mut base = Base { hits: Vec::new(), passes: Vec::new(), blocked: Vec::new(), uncovered: m.wanted.clone(), timed_out: false };
+    let mut base = Base {
+        hits: Vec::new(),
+        passes: Vec::new(),
+        blocked: Vec::new(),
+        uncovered: m.wanted.clone(),
+        unloadable: BTreeMap::new(),
+        unreachable: BTreeMap::new(),
+        over_cap: BTreeMap::new(),
+        timed_out: false,
+    };
     let mut errors: Vec<String> = Vec::new();
     let mut analysed_any = false;
     let mut load_errors: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
-    let order: Vec<&str> = std::iter::once(go.host_os.as_str()).chain(OTHER_GOOS.iter().copied().filter(|g| *g != go.host_os)).collect();
-    for (i, goos) in order.into_iter().enumerate() {
+    let standard = std::iter::once(go.host_os.as_str()).chain(OTHER_GOOS.iter().copied().filter(|g| *g != go.host_os));
+    let mut rounds: VecDeque<Round> = standard.map(|g| Round { goos: g.into(), arch: String::new(), tags: String::new(), only: None }).collect();
+    let mut planned = false;
+    let mut i = 0usize;
+    loop {
+        if rounds.is_empty() && !planned {
+            planned = true;
+            rounds.extend(plan_extras(go, m, &mut base));
+        }
+        let Some(Round { goos, arch, tags, only }) = rounds.pop_front() else { break };
         if base.uncovered.is_empty() {
             break;
         }
-        let patterns: Vec<String> = if i == 0 {
+        let first = i == 0;
+        i += 1;
+        let label = pass_label(&goos, &arch, &tags);
+        let patterns: Vec<String> = if first {
             vec!["./...".into()]
         } else {
-            base.uncovered.iter().map(|f| m.pattern(change::parent(f))).collect::<BTreeSet<_>>().into_iter().collect()
+            let files = base.uncovered.iter().filter(|f| only.as_ref().is_none_or(|o| o.contains(*f)));
+            files.map(|f| m.pattern(change::parent(f))).collect::<BTreeSet<_>>().into_iter().collect()
         };
-        let pkgs = match list(go, site, goos, &patterns) {
+        if patterns.is_empty() {
+            continue;
+        }
+        let pkgs = match list(go, site, (&goos, &arch, &tags), &patterns) {
             Ok(p) => p,
             Err(_) if go.budget.spent() => {
                 base.timed_out = true;
                 break;
             }
-            Err(e) if i == 0 => return Err(format!("go list failed: {e}")),
+            Err(e) if first => return Err(format!("go list failed: {e}")),
             Err(e) => {
-                notes.push(format!("{}: GOOS={goos} go list failed: {e}", m.label()));
+                notes.push(format!("{}: {label} go list failed: {e}", m.label()));
                 continue;
             }
         };
@@ -1028,23 +1420,23 @@ fn base_passes(go: &Go, m: &Module, site: &Site, notes: &mut Vec<String>) -> Res
         // import loads there); an error every GOOS repeats ends as a note.
         for p in &broken {
             let e = p.error.clone().unwrap_or_default();
-            errors.push(format!("GOOS={goos}: go cannot load {}: {}", p.import_path, with_hint(&e, &e)));
+            errors.push(format!("{label}: go cannot load {}: {}", p.import_path, with_hint(&e, &e)));
             load_errors.entry(p.import_path.clone()).or_insert_with(|| (e, p.files.clone()));
         }
         if holding.is_empty() {
             continue;
         }
-        let pass = Pass { goos: goos.to_string(), patterns: holding.iter().map(|p| m.pattern(&p.dir)).collect::<BTreeSet<_>>().into_iter().collect() };
+        let pass = Pass { goos, arch, tags, patterns: holding.iter().map(|p| m.pattern(&p.dir)).collect::<BTreeSet<_>>().into_iter().collect() };
         let run = match vet(go, site, &pass, false) {
             Ok(r) => r,
             Err(_) if go.budget.spent() => {
                 base.timed_out = true;
                 break;
             }
-            Err(e) if i == 0 => return Err(format!("go vet failed: {e}")),
+            Err(e) if first => return Err(format!("go vet failed: {e}")),
             Err(e) => {
-                notes.push(format!("{}: GOOS={goos} go vet failed: {e}", m.label()));
-                errors.push(format!("GOOS={goos}: {e}"));
+                notes.push(format!("{}: {label} go vet failed: {e}", m.label()));
+                errors.push(format!("{label}: {e}"));
                 continue;
             }
         };
@@ -1065,14 +1457,21 @@ fn base_passes(go: &Go, m: &Module, site: &Site, notes: &mut Vec<String>) -> Res
             }
         }
         analysed_any |= newly > 0;
-        if i > 0 && newly > 0 {
-            notes.push(format!("{}: GOOS={goos} pass analysed {newly} file(s) the host build leaves out.", m.label()));
+        if !first && newly > 0 {
+            notes.push(format!("{}: {label} pass analysed {newly} file(s) the host build leaves out.", m.label()));
         }
         base.blocked.extend(run.blocked);
         base.hits.extend(run.hits.into_iter().filter(|h| m.wanted.contains(&h.file)));
         // The raised copy reruns only the packages this pass analysed.
         if !analysed.is_empty() {
-            base.passes.push(Pass { goos: pass.goos, patterns: analysed.into_iter().collect() });
+            base.passes.push(Pass { goos: pass.goos, arch: pass.arch, tags: pass.tags, patterns: analysed.into_iter().collect() });
+        }
+    }
+    if !base.timed_out {
+        for (f, why) in std::mem::take(&mut base.over_cap) {
+            if base.uncovered.remove(&f) {
+                base.unreachable.insert(f, why);
+            }
         }
     }
     if !base.timed_out && !analysed_any && !errors.is_empty() {
@@ -1082,7 +1481,9 @@ fn base_passes(go: &Go, m: &Module, site: &Site, notes: &mut Vec<String>) -> Res
         if files.iter().any(|f| base.uncovered.contains(f)) {
             notes.push(format!("{}: {pkg} not analysed, go cannot load it: {}", m.label(), with_hint(e, e)));
             for f in files {
-                base.uncovered.remove(f);
+                if base.uncovered.remove(f) {
+                    base.unloadable.insert(f.clone(), format!("go cannot load its package {pkg}"));
+                }
             }
         }
     }
@@ -1136,6 +1537,15 @@ fn run_module(ctx: &Ctx, report: &mut StackReport, go: &Go, m: &Module, index: u
         }
     };
     report.findings.extend(base_findings(&base.hits, catalogue));
+    for (f, why) in &base.unloadable {
+        report.unscanned(f.clone(), why.clone());
+    }
+    for (f, why) in &base.unreachable {
+        report.unscanned(f.clone(), why.clone());
+    }
+    for f in &base.uncovered {
+        report.unscanned(f.clone(), if base.timed_out { "time ran out before go vet analysed it" } else { "no GOOS pass compiled it" });
+    }
     if base.timed_out {
         return Some(short_list(&base.uncovered.iter().cloned().collect::<Vec<_>>()));
     }
@@ -1232,9 +1642,9 @@ fn raised_passes(
 
     // The first minor that shows each one: only its package folders, per GOOS.
     let mut first_seen: HashMap<Key3, u32> = HashMap::new();
-    let mut steps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut steps: BTreeMap<(String, String, String), BTreeSet<String>> = BTreeMap::new();
     for h in extra.values() {
-        steps.entry(h.goos.clone()).or_default().insert(m.pattern(change::parent(&h.file)));
+        steps.entry((h.goos.clone(), h.arch.clone(), h.tags.clone())).or_default().insert(m.pattern(change::parent(&h.file)));
     }
     let mut timed_out = false;
     if version.major == go.version.major {
@@ -1245,8 +1655,8 @@ fn raised_passes(
             if set_go(&format!("{}.{minor}", version.major)).is_err() {
                 break;
             }
-            for (goos, patterns) in &steps {
-                let pass = Pass { goos: goos.clone(), patterns: patterns.iter().cloned().collect() };
+            for ((goos, arch, tags), patterns) in &steps {
+                let pass = Pass { goos: goos.clone(), arch: arch.clone(), tags: tags.clone(), patterns: patterns.iter().cloned().collect() };
                 match vet(go, &site, &pass, mod_mod) {
                     Ok(run) => {
                         for h in run.hits {
@@ -1290,7 +1700,16 @@ mod tests {
     use crate::change::Source;
 
     fn hit(file: &str, line: u32, column: u32, analyzer: &str, message: &str) -> Hit {
-        Hit { file: file.into(), line, column, analyzer: analyzer.into(), message: message.into(), goos: "linux".into() }
+        Hit {
+            file: file.into(),
+            line,
+            column,
+            analyzer: analyzer.into(),
+            message: message.into(),
+            goos: "linux".into(),
+            arch: String::new(),
+            tags: String::new(),
+        }
     }
 
     #[test]
@@ -1395,9 +1814,10 @@ mod tests {
         assert_eq!(off, vec!["-buildtag=false", "-hostport=false"]);
         assert_eq!(disable_flags(&["json".to_string()]), Vec::<String>::new(), "only flags the tool has");
         let fix = Path::new("/go/pkg/tool/x/fix");
-        let args = vet_args(fix, &off, true, &["./board".to_string()]);
+        let args = vet_args(fix, &off, true, "", &["./board".to_string()]);
         assert_eq!(args, vec!["vet", "-mod=mod", &format!("-vettool={}", fix.display()), "-json", "-buildtag=false", "-hostport=false", "./board"]);
-        assert!(!vet_args(fix, &off, false, &[]).contains(&"-mod=mod".to_string()));
+        assert!(!vet_args(fix, &off, false, "", &[]).contains(&"-mod=mod".to_string()));
+        assert!(vet_args(fix, &off, false, "a,b", &[]).contains(&"-tags=a,b".to_string()));
         assert_eq!(fix_path("/t").file_name().unwrap().to_string_lossy(), format!("fix{}", std::env::consts::EXE_SUFFIX));
         let budget = Budget::new(Duration::ZERO);
         assert!(budget.left().is_none() && budget.spent());
@@ -1578,5 +1998,90 @@ mod tests {
         assert_eq!(sources(&change, &modules[0]), vec!["app/go.mod", "app/main.go", "go.work", "go.work.sum", "lib/go.mod", "lib/lib.go"]);
         assert_eq!(modules[1].workspace, None, "a module the go.work does not use runs with GOWORK=off");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_constraints_pick_the_pass_that_compiles_the_file() {
+        let linux = ("linux", "amd64");
+        let t = table();
+        let ok = |name: &str, expr: Option<&str>, host| needs(name, expr, host, Some(&t));
+        let want = |goos: &str, arch: &str, tags: &str| Ok((goos.to_string(), arch.to_string(), tags.to_string()));
+        assert_eq!(ok("a.go", None, linux), want("linux", "", ""));
+        assert_eq!(ok("it.go", Some("integration"), linux), want("linux", "", "integration"));
+        assert_eq!(ok("tools.go", Some("tools"), ("windows", "arm64")), want("windows", "", "tools"));
+        assert_eq!(ok("x_freebsd.go", None, linux), want("freebsd", "", ""));
+        assert_eq!(ok("x_freebsd_amd64_test.go", None, linux), want("freebsd", "", ""), "only the GOOS and GOARCH suffixes count");
+        assert_eq!(ok("generic.go", Some("!amd64 && !arm64"), ("windows", "amd64")), want("windows", "386", ""), "windows has no arm or riscv64");
+        assert_eq!(ok("generic.go", Some("!amd64 && !arm64 && !386"), ("windows", "amd64")), want("freebsd", "arm", ""));
+        assert_eq!(ok("a.go", Some("windows && integration"), linux), want("windows", "", "integration"));
+        assert_eq!(ok("a.go", Some("(e2e || smoke) && !windows"), linux), want("linux", "", "e2e"), "the fewest tags");
+        assert_eq!(ok("a.go", Some("!integration"), linux), want("linux", "", ""));
+        assert_eq!(ok("a.go", Some("unix && go1.21 && gc && smoke"), ("windows", "amd64")), want("linux", "", "smoke"), "unix needs a unix GOOS");
+        assert_eq!(ok("linux.go", None, ("windows", "amd64")), want("windows", "", ""), "the first name element is no suffix");
+        assert_eq!(ok("x_arm64.go", None, linux), want("linux", "arm64", ""), "the CPU type is part of the pass");
+        assert_eq!(ok("x_arm64.go", None, ("windows", "arm64")), want("windows", "", ""), "the host's own GOARCH is the default");
+        assert_eq!(ok("x_linux_arm64.go", None, ("windows", "amd64")), want("linux", "arm64", ""));
+        assert_eq!(ok("a.go", Some("linux && arm64 && smoke"), ("windows", "amd64")), want("linux", "arm64", "smoke"));
+        // Negation only: a GOOS or GOARCH the expression does not name meets it.
+        assert_eq!(ok("generic.go", Some("!amd64 && !arm64"), linux), want("linux", "386", ""));
+        assert_eq!(ok("other.go", Some("!windows && !linux && !darwin"), ("windows", "amd64")), want("freebsd", "", ""));
+        assert_eq!(ok("x.go", Some("!freebsd && !linux && !riscv64 && !amd64"), linux), want("netbsd", "386", ""), "the next unnamed one");
+        assert!(ok("a.go", Some("cgo"), linux).unwrap_err().contains("without cgo"));
+        assert!(ok("a.go", Some("a && b && c && d && e && f && g"), linux).unwrap_err().contains("too many"));
+    }
+
+    fn table() -> Pairs {
+        let t = [
+            ("aix", vec!["ppc64"]),
+            ("freebsd", vec!["386", "amd64", "arm", "arm64", "riscv64"]),
+            ("js", vec!["wasm"]),
+            ("linux", vec!["386", "amd64", "arm", "arm64", "riscv64"]),
+            ("wasip1", vec!["wasm"]),
+            ("windows", vec!["386", "amd64", "arm64"]),
+            ("darwin", vec!["amd64", "arm64"]),
+            ("netbsd", vec!["386", "amd64", "arm", "arm64"]),
+            ("openbsd", vec!["386", "amd64", "arm", "arm64", "riscv64"]),
+        ];
+        t.into_iter().map(|(os, archs)| (os.to_string(), archs.into_iter().map(String::from).collect())).collect()
+    }
+
+    #[test]
+    fn default_arch_follows_the_pair_table() {
+        let host = ("windows", "arm64");
+        let t = table();
+        assert_eq!(default_arch("windows", host, Some(&t)), "arm64", "the host's own");
+        assert_eq!(default_arch("linux", host, Some(&t)), "amd64");
+        assert_eq!(default_arch("js", host, Some(&t)), "wasm");
+        assert_eq!(default_arch("wasip1", host, Some(&t)), "wasm");
+        assert_eq!(default_arch("aix", host, Some(&t)), "ppc64");
+        assert_eq!(default_arch("js", host, None), "amd64", "no table: today's behaviour");
+        assert_eq!(default_arch("nacl", host, Some(&t)), "amd64", "unknown GOOS");
+    }
+
+    #[test]
+    fn negated_constraints_take_the_first_valid_unnamed_arch() {
+        let t = table();
+        assert_eq!(fallback_arch("freebsd", &["amd64", "arm64"], Some(&t)).as_deref(), Some("386"));
+        assert_eq!(fallback_arch("freebsd", &["386"], Some(&t)).as_deref(), Some("arm"));
+        assert_eq!(fallback_arch("freebsd", &["386", "arm"], Some(&t)).as_deref(), Some("amd64"), "then the rest in table order");
+        assert_eq!(fallback_arch("js", &["386"], Some(&t)).as_deref(), Some("wasm"));
+        assert_eq!(fallback_arch("freebsd", &["386"], None).as_deref(), Some("arm"));
+        let want = |goos: &str, arch: &str| Ok((goos.to_string(), arch.to_string(), String::new()));
+        assert_eq!(needs("a.go", Some("!windows && !linux"), ("windows", "amd64"), Some(&t)), want("freebsd", ""));
+        assert_eq!(needs("w.go", None, ("windows", "amd64"), Some(&t)), want("windows", ""));
+        assert_eq!(needs("z_wasip1.go", None, ("windows", "amd64"), Some(&t)), want("wasip1", ""), "wasm is its default");
+        assert_eq!(
+            needs("x_js_arm64.go", None, ("windows", "amd64"), Some(&t)).map(|_| ()),
+            Err("its build constraint `` is not met under GOOS=js (any GOARCH it names) without cgo".to_string())
+        );
+    }
+
+    #[test]
+    fn constraint_expressions_evaluate() {
+        let on = |t: &str| ["a", "b"].contains(&t);
+        let eval = |e: &str| Constraint { tokens: constraint_tokens(e), at: 0, tag: &on }.or();
+        assert!(eval("a && b") && eval("a||c") && eval("!c") && eval("(a || c) && !(c && d)") && eval("!!a"));
+        assert!(!eval("a && c") && !eval("c || d") && !eval("!(a)") && !eval(""));
+        assert_eq!(constraint_tokens("a&&(b||!c)"), vec!["a", "&", "&", "(", "b", "|", "|", "!", "c", ")"]);
     }
 }

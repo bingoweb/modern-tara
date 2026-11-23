@@ -34,9 +34,9 @@ modern-tara scan --repo . --range origin/main..HEAD --gate
 modern-tara scan --repo . --files src/app.py --all-lines
 ```
 
-`--gate` yalnız kesin `modern` bulgu varsa 1 ile çıkar; `needs-newer` ve düşük güvenli bulgular uyarı olarak yazılır. Ayrıntılar: [docs/USAGE.md](docs/USAGE.md).
+`--gate` yalnız kesin `modern` bulgu varsa 1 ile çıkar; `needs-newer` ve düşük güvenli bulgular uyarı olarak yazılır. Değişen bir dosya taranamazsa (o dilin aracı yoksa, atlandıysa ya da dosya okunamadıysa) `--gate` 2 ile çıkar; bunu bilerek kabul etmek için `--allow-skipped <dil,...|all>` verilir. `--range a...b`, `b` dalını `a` ile ortak atasından bu yana tarar. Ayrıntılar: [docs/USAGE.md](docs/USAGE.md).
 
-Bazen eski biçim bilerek kalır: bir modül dizisi bitene kadar CommonJS, açılışı bekletmemesi gereken bir `.catch()` zinciri gibi. Bunları deponun kökündeki `modern-tara.toml` dosyasına kural, yol ve gerekçeyle yazıyorum; istenirse bir bitiş tarihi de veriliyor. Bu bulgular raporda `waived` olarak görünür ve kapıyı durdurmaz; süresi dolan istisnanın bulguları ise kendiliğinden yeniden sayılır.
+Bazen eski biçim bilerek kalır: bir modül dizisi bitene kadar CommonJS, açılışı bekletmemesi gereken bir `.catch()` zinciri gibi. Bunları deponun kökündeki `modern-tara.toml` dosyasına kural, yol ve gerekçeyle yazıyorum (`# noqa`, `eslint-disable`, `#[allow]` gibi satır içi susturmalar bulguyu gizlemez); istenirse bir bitiş tarihi de veriliyor. Bu bulgular raporda `waived` olarak görünür ve kapıyı durdurmaz; süresi dolan istisnanın bulguları ise kendiliğinden yeniden sayılır.
 
 ```toml
 [[waiver]]
@@ -60,7 +60,7 @@ Araç sürümleri `tools.toml` içinde tek yerde durur.
 ## GitHub Actions
 
 ```yaml
-- uses: bingoweb/modern-tara@v0.4.0
+- uses: bingoweb/modern-tara@v0.5.0
 ```
 
 Eylem sürümü indirir, SHA256'sını doğrular, araçları kurar ve pull request ya da push aralığını `--gate` ile tarar; özeti iş akışı sayfasına yazar.

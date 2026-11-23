@@ -39,19 +39,21 @@ Side effects outside the repository:
 ## Command line
 
 ```
-modern-tara scan [--repo <dir>] [--range <a>..<b> | --staged] [--files <f>...] [--all-lines]
+modern-tara scan [--repo <dir>] [--range <a>..<b> | <a>...<b> | --staged] [--files <f>...] [--all-lines]
                  [--stacks csharp,rust,python,js,css,powershell,go] [--json <out.json>] [--quiet]
-                 [--git-safe] [--timeout <seconds>] [--gate] [--waivers <file> | --no-waivers]
+                 [--git-safe] [--timeout <seconds>] [--gate] [--allow-skipped <stack,...|all>]
+                 [--waivers <file> | --no-waivers]
 modern-tara --version     # this tool, every underlying tool, and tools.toml mismatches
 ```
 
 | change source | lines | file contents |
 |---|---|---|
 | `--range a..b` | `git diff -U0 a b` | revision `b` (`git cat-file --batch`), never the work tree |
+| `--range a...b` | `git diff -U0 $(git merge-base a b) b` (what a pull request adds; histories with no common commit are an error that says to use `a..b`) | revision `b` |
 | `--staged` | `git diff -U0 --cached HEAD` | the index |
 | neither | `git diff -U0 HEAD`, untracked files whole | the work tree |
 | `--files f... --all-lines` | whole files (globs allowed, also outside git) | work tree / folder |
-| `--all-lines` alone | every tracked file | as above |
+| `--all-lines` alone | git: every tracked file and every untracked file that is not ignored; a plain folder: every file except under `.git`, `node_modules`, `target`, `bin` (but `src/bin`), `obj`, `.venv`, `__pycache__`, `dist`, `build` | as above |
 
 - stdout: JSON (or `--json FILE`); stderr: one line per stack, a total line,
   and with `--gate` a final gate line. `--quiet` drops all of stderr.
@@ -62,6 +64,11 @@ modern-tara --version     # this tool, every underlying tool, and tools.toml mis
 - `--timeout` (and each default) applies **per child process**, not per stack,
   except for Go: there it is one budget for all go calls of the stack
   (default 600 s).
+- Every tool that takes a file list on its command line (ruff, ast-grep,
+  `go list`/`go vet`) runs in chunks that keep each command line under 24000
+  UTF-16 units (Windows allows 32767); the results are merged. For
+  `dotnet format` a list that does not fit drops `--include` and formats the
+  touched projects whole (findings are still cut to the changed lines).
 - `--waivers FILE` reads the waivers from FILE instead of the repository's
   `modern-tara.toml`; `--no-waivers` ignores every waiver (an audit's full
   view). See [Waivers](#waivers).
@@ -99,19 +106,45 @@ scanning nothing. A plain path that does not exist is always an error.
 |---|---|---|
 | `0` | no findings | no finding with `kind: "modern"` and `confidence: "high"` (other findings are warnings) |
 | `1` | at least one finding (any kind) | at least one `modern` + `high` finding |
-| `2` | tool error, or a stack failed and nothing was found | tool error, or a stack failed and no `modern` + `high` finding was found |
+| `2` | tool error, or a stack failed and nothing was found | tool error, or a stack failed, or a stack with touched files was `skipped` or left a touched file unscanned (see below), and no `modern` + `high` finding was found |
 
 `needs-newer`, `baseline` and every `low` finding never stop the gate; they
 are still in the JSON and in the counts. A finding an active waiver covers is
 never counted, with or without `--gate` ([Waivers](#waivers)). With `--gate` the last stderr line is
 `modern-tara: gate passed` (exit 0) or
 `modern-tara: gate stopped (<n> high-confidence modern findings)` (exit 1);
-exit 2 prints no gate line.
+an exit 2 caused by stacks prints
+`modern-tara: gate failed (<stack> error, <stack> skipped, <stack> <n> unscanned; ...)`.
+
+**No false green.** Under `--gate`, a stack that has at least one touched
+file and ends `skipped` (tool missing, `js/node_modules` missing) or leaves a
+touched file unscanned makes the exit 2. Unscanned means: a `.rs` file with
+no `Cargo.toml` above it (clippy never ran; catalogue rules only), a `.cs`
+file with no `.csproj` above it, a `.go` file with no `go.mod` above it or in
+a package go cannot load or no GOOS and build-tag pass compiled, a file ESLint, ruff,
+stylelint, @eslint/css or PSScriptAnalyzer could not parse (a fatal parse
+error is an unscanned file, never a clean one and never a finding; a missing
+module (`using module`) or type in PowerShell is only a note, and a file ruff
+cannot read, such as one that is not UTF-8, is unscanned), a file
+over 8 MiB or unreadable, every file of a skipped stack, and the files of a
+workspace or project whose tool did not finish. `--allow-skipped
+<stack,...|all>` (every name is checked like `--stacks`, also next to `all`) accepts skipped and
+unscanned for those stacks; it never accepts an `error`, which stays exit 2
+as before. A stack with no touched file never fails. Without `--gate` the exit
+codes stay as in the table; the same facts are reported. Changed files
+under `vendor/`, `testdata/`, `_`/`.` folders or `//go:build ignore`
+(Go) are left out by design and are not unscanned.
+
+Changed files no stack takes (`.html`, `.scss`, no extension, ...) are
+counted in `no_stack` and on stderr (`modern-tara: <n> changed file(s) match
+no stack (html 2, scss 1)`); they never fail anything.
 
 The summary counts findings per kind and confidence, per stack and in total:
 
 ```
 python     ok        1 files  2 modern high, 1 needs-newer low                0.4s
+rust       ok        2 files  no findings, 1 unscanned                        1.2s
+modern-tara: rust unscanned: tools/x.rs: no Cargo.toml above it: clippy did not run (catalogue rules only)
 modern-tara: 3 findings (2 modern high, 1 needs-newer low) in 0.6s
 modern-tara: gate stopped (2 high-confidence modern findings)
 ```
@@ -119,11 +152,13 @@ modern-tara: gate stopped (2 high-confidence modern findings)
 ## JSON
 
 ```json
-{ "tool": "modern-tara", "version": "0.4.0", "repo": "C:/...",
+{ "tool": "modern-tara", "version": "0.5.0", "repo": "C:/...",
   "change": { "mode": "range|staged|worktree|files", "from", "to", "all_lines", "files", "changed_lines", "git_safe",
-              "unmatched": [] },
+              "merge_base", "unmatched": [] },
   "stacks": [ { "stack", "files": [], "pins": {}, "newest": {}, "tool": "ruff 0.17.6",
-                "status": "ok|skipped|error", "message", "duration_ms" } ],
+                "status": "ok|skipped|error", "message", "duration_ms",
+                "unscanned": [ { "file", "reason" } ], "allowed": false,
+                "rules": [ "UP", "FURB", "PTH", "SIM", "python-asyncio-gather" ] } ],
   "findings": [ { "stack", "file", "line", "column", "rule", "message",
                   "kind": "modern|needs-newer|baseline", "confidence": "high|low",
                   "source": "tool|ast-grep",
@@ -132,8 +167,18 @@ modern-tara: gate stopped (2 high-confidence modern findings)
   "waivers": { "file": "modern-tara.toml" | "<--waivers path>" | null,
                "entries": [ { "index", "rule", "paths", "stack", "reason", "card", "expires",
                               "status": "active|expired", "matched" } ] },
-  "warnings": [] }
+  "warnings": [],
+  "no_stack": { "files": 3, "extensions": { "html": 2, "(none)": 1 } } }
 ```
+
+`rules` lists the rule ids that ran, from the same constants the stack passes
+to its tool: ruff's `--select` codes, the clippy lints (`clippy::manual_*`
+stands for every `manual_*` lint), the IDE/CA/SYSLIB ids, the ESLint and
+stylelint rules the generated configs turn on, the PSScriptAnalyzer rules,
+`go/<analyzer>` for `ANALYZERS`, and the stack's ast-grep catalogue rules
+(only when ast-grep ran). `allowed` is true when `--allow-skipped` names the
+stack. `change.merge_base` is true for `--range a...b` (`from` is then the
+merge base).
 
 `change.unmatched` is there only when a `--files` glob matched nothing.
 `warnings` holds the texts of the warning lines stderr prints, without their
@@ -156,13 +201,27 @@ Confidence:
   (a rule without it counts as `low`). Low today: `csharp-datetime-now`,
   `csharp-httpclient-per-call`, `csharp-new-random`, `python-asyncio-gather`,
   `javascript-http-client-package` and its `typescript-` and `tsx-` twins,
-  `go-ioutil-readdir`, `go-math-rand-v2`.
+  `go-ioutil-readdir`, `go-math-rand-v2`, `rust-oncelock-static-lazylock-captures`.
   Also low: stylelint `declaration-block-no-redundant-longhand-properties`
   (see [Rule selection](#rule-selection)), `go/omitzero` (its fix changes
   encoding/json output) and any `go fix` analyzer not yet in `ANALYZERS` in
   `src/stacks/go.rs`.
 
 A missing tool sets the stack to `skipped`, and `message` says what to install.
+
+## Inline suppressions
+
+Inline suppressions do not hide findings: ruff runs with `--ignore-noqa`,
+the ESLint and /css configs set `linterOptions.noInlineConfig: true`, stylelint runs
+with `ignoreDisables`, and clippy gets every reported lint (and the
+`pedantic`, `style`, `complexity`, `perf` and `suspicious` groups) as
+`--force-warn`, so `#[allow]`, `#[expect]` and `deny` do not change them.
+Waivers in `modern-tara.toml` are the only sanctioned suppression.
+PSScriptAnalyzer runs with `-IncludeSuppressed`, so `[SuppressMessageAttribute]`
+does not hide a finding either. `dotnet format` still honours its own
+suppressions: a `#pragma warning disable` (or `[SuppressMessage]`) hides the
+Roslyn findings (IDE, CA) on the lines it covers; only the ast-grep catalogue
+rules still see those lines.
 
 ## Waivers
 
@@ -295,8 +354,11 @@ SYSLIB1045 SYSLIB1054. A section appended to the copy's root `.editorconfig`
 sets these IDs to `suggestion` and picks the modern style options (for
 example, file-scoped namespaces). A closer `.editorconfig` still wins. Messages
 are in English because of `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1`.
-`newest` (.NET 11 / C# 15) comes from a constant table; with SDK 10, C# 15
-checks are catalogue only and no C# needs-newer findings come from the tools.
+`newest` (.NET 11 / C# 15) comes from a constant table; when `dotnet
+--list-sdks` has no SDK 11 or newer, `message` says the C# 15 checks need it
+(catalogue only), and no C# needs-newer findings come from the tools. An
+IDE0090 finding on a file and line another finding already reports is
+dropped.
 The IDE rules report without any `.editorconfig` severity, except IDE0161
 (needs `file_scoped`). `--no-restore` works on a project that was never
 restored, but package types stay unresolved, so the restore runs in the copy
@@ -306,8 +368,9 @@ used: its whitespace pass shifts the line numbers.
 **Rust** (`.rs`). Pins: nearest `Cargo.toml`, with workspace inheritance
 (`edition`, `rust-version`). The workspace and its path dependencies are
 copied, but `rust-toolchain*` is left out, so rustup never installs anything.
-The tool runs `cargo clippy --message-format=json --all-targets --keep-going -- -W clippy::pedantic -W <15 lints>`.
-It reports only modern-idiom lints: the `-W` list, every `manual_*` lint,
+The tool runs `cargo clippy --message-format=json --workspace --all-targets --keep-going -- --force-warn <groups and lints>`
+(`--workspace`: every member of a workspace whose root is also a package).
+It reports only modern-idiom lints: `WARN`, every `manual_*` lint,
 `MODERN_EXTRA` in `src/stacks/rust.rs` (map_unwrap_or, io_other_error,
 legacy_numeric_constants, question_mark, ptr_as_ptr, …), and any message that
 mentions stabilization or MSRV. A second copy gets `rust-version` raised to the
@@ -316,20 +379,26 @@ toolchain version and edition 2024 (if older), and clippy msrv is removed.
 `rust-version` raised to the version the lint names. Findings that appear only
 in the raised run are `needs-newer`, and `message` says how many there were.
 If the raised copy fails to compile, `message` says that instead.
-`collapsible_if` is collected in both runs but reported only when the raised
+A `.rs` file with no `Cargo.toml` above it is unscanned (catalogue rules
+only). `collapsible_if` is collected in both runs but reported only when the raised
 run alone shows it: that means let chains (edition 2024, Rust 1.88). Clippy
 will not collapse an `if` whose block contains a comment. `CARGO_TARGET_DIR`
 is the [cache](#cache) folder for `fnv(repo|rust|workspace)`, with
 `CARGO_INCREMENTAL=0`. Local-crate artifacts older than the run are pruned,
 because each run's copy path makes a new hash. `CC` and `CXX` are removed from
-the child environment on an `*-msvc` host.
+the child environment on an `*-msvc` host. A `.rs` file that no `mod` declaration
+reaches (a stray script next to `main.rs`) is not compiled by clippy, so only
+the ast-grep catalogue rules see it; the report does not list it as unscanned
+when a `Cargo.toml` is above it.
 
 **Python** (`.py .pyi`). Pins: nearest `pyproject.toml` `requires-python`,
 else `.python-version`, else unknown (assumed 3.15). The tool runs
-`ruff check --no-cache --isolated --select UP,FURB,PTH,SIM --target-version pyXY`
+`ruff check --no-cache --isolated --ignore-noqa --select UP,FURB,PTH,SIM,E902 --target-version pyXY`
 with no `--preview`, then the same at `py315`. Findings that only the newer
 targets show are `needs-newer`. `to` is the first target that shows them,
-found by running each version in between.
+found by running each version in between. E902 (io-error) is never a finding:
+a file ruff cannot read (for example Windows-1254 bytes, which are not UTF-8,
+ruff's `Failed to lint ... not valid UTF-8`) is an unscanned file.
 
 **JS/TS** (`.js .mjs .cjs .jsx .ts .mts .cts .tsx`). Pins: nearest
 `package.json` (`engines.node`, `type`, `browserslist`) and `tsconfig.json`.
@@ -378,8 +447,17 @@ color-function-notation (modern), media-feature-range-notation (context) and
 the five `*-no-vendor-prefix` rules; declaration-block-no-redundant-longhand-properties
 gives `modern` + `low` for the newer shorthands only. stylelint 17 has no core rule for logical
 properties, so @eslint/css `css/prefer-logical-properties` covers them (kind
-`modern`). `plugin/use-baseline` gives `baseline`, with `available` taken from
-browserslist (`baseline widely|newly|<year>`), else `widely`.
+`modern`), as the CSS catalogue prescribes: its `allowProperties` and
+`allowUnits` options keep only `margin-left/right`, `padding-left/right`,
+`border-left/right` (and their `-color`, `-style`, `-width`), `left` and
+`right` (`LOGICAL_PROPERTIES` in `src/stacks/js.rs`), `high` except `left` and `right`, which are `low` (a positioned box is often physical on purpose); `text-align:
+left|right` is `high`, other values (`float`, `clear`, `resize`, ...) are
+`low`; `width`, `height`, `top`, `bottom`, the other properties and the
+viewport units (`vh` → `dvh`, not `vb`, in the catalogue) are not reported. `plugin/use-baseline` gives `baseline`, with `available` taken from
+browserslist (`baseline widely|newly|<year>`), else `widely`. /css runs
+with `languageOptions.tolerant`, so modern syntax its parser rejects
+(`@custom-variant`, `@import "tailwindcss" source(none)`, CSS `if()`) does not make a
+file unscanned; stylelint's syntax errors still do.
 
 **PowerShell** (`.ps1 .psm1`). Runs wherever `pwsh` (PowerShell 7) is found,
 Linux included; without it the stack is `skipped`. Host: `#Requires -Version 6+`
@@ -390,7 +468,11 @@ decides; with no launcher the host is unknown. `ps/run-pssa.ps1` runs through
 `pwsh -NoProfile -NonInteractive -File`, never a command string built from
 paths. Rules: PSAvoidUsingWMICmdlet gives `modern`; PSUseCompatibleSyntax
 gives `baseline`, with TargetVersions 7.0, 5.1, or both for an unknown host. A
-5.1 host adds a needs-newer note: PowerShell 7.7 is the newest stable.
+5.1 host adds a needs-newer note: PowerShell 7.7 is the newest stable. Only real
+syntax errors (`ParseError` records) make a file unscanned; `using module` of a
+module that is not installed (`ModuleNotFoundDuringParse`) and `TypeNotFound`
+become a note and the file is analysed. `[SuppressMessageAttribute]` does not
+hide findings (`-IncludeSuppressed`).
 
 **Go** (`.go`). Needs Go 1.26 or newer, whose `go fix` (cmd/fix) has the
 modernizers; with an older Go or none the stack is `skipped`. Pins: the `go`
@@ -418,7 +500,12 @@ GOOS compiled. A package counts as analysed when vet printed its entry, even
 if its test variant failed. A package vet names as failed (a `# pkg` header,
 such as code that type-checks only on Linux) is retried under the next GOOS;
 the module fails only when no GOOS analysed any changed file, with each
-GOOS's error line. A changed package go cannot load (`go list`
+GOOS's error line. A file only a build tag or another GOOS includes
+(`//go:build integration`, `//go:build tools`, `x_freebsd.go`, `y_arm64.go`, `linux && arm64`)
+is then compiled by an extra pass for its (GOOS, GOARCH, `-tags`) combination, the fewest
+custom tags that satisfy the constraint (GOARCH is the host's on the host GOOS, else amd64, else the first one the GOOS has (js and wasip1: wasm; the pairs come from `go tool dist list -json`) unless the file names another, no cgo; a constraint that only negates, such as `!amd64 && !arm64` or `!windows && !linux && !darwin`, also tries a GOOS and a GOARCH it does not name: freebsd/netbsd/openbsd, 386, then arm, then the rest, whichever pair is valid);
+at most 3 such passes per module, and a file still uncovered after every pass has run that was beyond the cap, or whose constraint
+no pass meets (`cgo`), is unscanned with the reason. A changed package go cannot load (`go list`
 `Error` or `DepsErrors`, such as a `//go:embed` pattern on files git does not
 track) is left out of vet and named in `message` with its error and what to
 do; the stack fails only when no changed package of the host pass loads. A
@@ -453,11 +540,15 @@ fails and `message` says what was not analysed. `newest` is the larger of the
 toolchain's minor and `NEWEST_GO` (1.27); an older toolchain adds a note.
 
 **ast-grep catalogue** (`rules/*.yml`, `sgconfig.yml`; `metadata.gate/min`
-decide needs-newer, `metadata.confidence` the confidence): C# `new HttpClient()`
+decide needs-newer, `metadata.confidence` the confidence; a broken rule
+file, an `Error:`/`ERROR:` line on stderr or a failed run makes the stack
+`error`, never clean): C# `new HttpClient()`
 in a method, `DateTime.UtcNow/Now` → `TimeProvider`, `new Random()` →
 `Random.Shared` (all low); Rust `strip_prefix(..).unwrap_or(s | &s)` →
-`trim_prefix` (1.100), `static X: OnceLock<T>` → `LazyLock` (1.80),
-`Duration::from_secs(x * 60 | x * 3600)` → `from_mins`/`from_hours` (1.91;
+`trim_prefix` (1.100), `static X: OnceLock<T>` filled by `get_or_init` and never `.set()` in the
+file → `LazyLock` (1.80; high, but `rust-oncelock-static-lazylock-captures`, low, when
+the call sits in a function with parameters the closure may capture),
+`(std::time::)Duration::from_secs(x * 60 | 60 * x | x * 3600 | 3600 * x)` → `from_mins`/`from_hours` (1.91; no other `x * 60`;
 clippy's duration_suboptimal_units only fires on constants) (all high); Python
 `asyncio.gather` → `TaskGroup` (3.11, low); JS/TS axios / node-fetch → global
 `fetch` (low); Go (`metadata.gate: go`, read from go.mod) `ioutil.ReadAll/
@@ -540,17 +631,20 @@ To move a pin: edit `tools.toml` (and, for npm, the exact versions in
   with:
     go-version: "1.27.4"
     cache: false
-- uses: bingoweb/modern-tara@v0.4.0
+- uses: bingoweb/modern-tara@v0.5.0
   with:
     args: --stacks rust,python,go
 ```
 
 Inputs: `version` (a release tag; default the tag the action is used at),
-`range` (default: for a pull request `merge-base(base, head)..head`, else
+`range` (`a..b` or `a...b`; default: for a pull request `base...head`, that is
+`merge-base(base, head)..head`, else
 `github.event.before..github.sha`, or `sha~1..sha` for a new branch), `args`
 (more `scan` arguments, split on spaces), `waivers` (a waiver file in the
 checkout, passed as `--waivers`; default: the scanned revision's own
-`modern-tara.toml`, so most repositories leave it empty). A push whose `before` is gone
+`modern-tara.toml`, so most repositories leave it empty), `allow-skipped`
+(passed as `--allow-skipped`; default none, so a skipped stack or an
+unscanned file fails the gate). A push whose `before` is gone
 (force push) first fetches that commit; if it is still missing, or `before`
 is all zeros, the range is `sha~1..sha`, and a root commit is scanned with
 `--all-lines`.

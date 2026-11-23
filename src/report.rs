@@ -95,9 +95,11 @@ impl Finding {
 
 /// The exit code: `1` when a finding counts (with `gate`, only high-confidence
 /// `modern` findings count; the rest are warnings), else `2` when a stack
-/// failed, else `0`.
-pub fn exit_code(findings: &[Finding], failed: bool, gate: bool) -> i32 {
+/// failed (with `gate` also when one did not scan all its touched files, see
+/// [`StackReport::incomplete`]), else `0`.
+pub fn exit_code(findings: &[Finding], stacks: &[StackReport], gate: bool) -> i32 {
     let counted = if gate { findings.iter().any(Finding::stops_gate) } else { !findings.is_empty() };
+    let failed = stacks.iter().any(|s| s.status == Status::Error || (gate && s.incomplete()));
     if counted {
         1
     } else if failed {
@@ -127,6 +129,12 @@ pub struct StackReport {
     pub warnings: Vec<String>,
     pub duration_ms: u64,
     pub findings: Vec<Finding>,
+    /// Touched files the stack could not scan, with the reason.
+    pub unscanned: BTreeMap<String, String>,
+    /// The rule ids that ran (tool rules and catalogue rules).
+    pub rules: Vec<String>,
+    /// `--allow-skipped` names this stack: skipped or unscanned does not fail `--gate`.
+    pub allowed: bool,
 }
 
 impl StackReport {
@@ -142,7 +150,29 @@ impl StackReport {
             warnings: Vec::new(),
             duration_ms: 0,
             findings: Vec::new(),
+            unscanned: BTreeMap::new(),
+            rules: Vec::new(),
+            allowed: false,
         }
+    }
+    /// A touched file this stack could not scan; the first reason stays.
+    pub fn unscanned(&mut self, file: impl Into<String>, why: impl Into<String>) {
+        self.unscanned.entry(file.into()).or_insert_with(|| why.into());
+    }
+    /// Rule ids that ran, once each, in order.
+    pub fn ran<S: Into<String>>(&mut self, ids: impl IntoIterator<Item = S>) {
+        for id in ids {
+            let id = id.into();
+            if !self.rules.contains(&id) {
+                self.rules.push(id);
+            }
+        }
+    }
+    /// Whether `--gate` fails on this stack (besides an error): it has
+    /// touched files, `--allow-skipped` does not name it, and it was skipped
+    /// or left a touched file unscanned.
+    pub fn incomplete(&self) -> bool {
+        !self.files.is_empty() && !self.allowed && (self.status == Status::Skipped || !self.unscanned.is_empty())
     }
     pub fn note(&mut self, text: impl Into<String>) {
         let t = text.into();
@@ -157,8 +187,13 @@ impl StackReport {
             self.warnings.push(t);
         }
     }
+    /// Skipped: every touched file is unscanned, for `why`.
     pub fn skip(&mut self, why: impl Into<String>) {
+        let why = why.into();
         self.status = Status::Skipped;
+        for f in self.files.clone() {
+            self.unscanned(f, why.clone());
+        }
         self.note(why);
     }
     pub fn fail(&mut self, why: impl Into<String>) {
@@ -181,9 +216,15 @@ impl StackReport {
             "status": match self.status { Status::Ok => "ok", Status::Skipped => "skipped", Status::Error => "error" },
             "message": self.messages.join(" "),
             "duration_ms": self.duration_ms,
+            "unscanned": self.unscanned.iter().map(|(file, reason)| json!({"file": file, "reason": reason})).collect::<Vec<_>>(),
+            "allowed": self.allowed,
+            "rules": self.rules,
         })
     }
 }
+
+/// Changed files no stack takes, per extension (lowercase, `(none)` without one).
+pub type NoStack = BTreeMap<String, usize>;
 
 /// Sorted, de-duplicated findings (same place, rule and kind once).
 pub fn tidy(findings: &mut Vec<Finding>) {
@@ -197,6 +238,7 @@ pub struct Extras<'a> {
     pub waived: &'a [Value],
     pub waivers: &'a Value,
     pub warnings: &'a [String],
+    pub no_stack: &'a NoStack,
 }
 
 pub fn document(version: &str, repo: &str, change: &Value, stacks: &[StackReport], findings: &[Finding], extras: &Extras) -> Value {
@@ -210,6 +252,7 @@ pub fn document(version: &str, repo: &str, change: &Value, stacks: &[StackReport
         "waived": extras.waived,
         "waivers": extras.waivers,
         "warnings": extras.warnings,
+        "no_stack": {"files": extras.no_stack.values().sum::<usize>(), "extensions": extras.no_stack},
     })
 }
 
@@ -227,12 +270,24 @@ fn counts<'a>(findings: impl Iterator<Item = &'a Finding>) -> String {
 
 /// A few lines for a human: per stack, status, counts per kind and
 /// confidence, time. `gate` is the `--gate` exit code: a final line says
-/// whether the gate passed (none for a tool error). `warnings` print before
-/// the totals line; `waived` is how many findings a waiver took out.
-pub fn summary(stacks: &[StackReport], findings: &[Finding], waived: usize, warnings: &[String], total_ms: u64, gate: Option<i32>) -> String {
+/// whether the gate passed or what failed it. `warnings` print before the
+/// totals line; `waived` is how many findings a waiver took out; `no_stack`
+/// counts the changed files no stack takes.
+pub fn summary(
+    stacks: &[StackReport],
+    findings: &[Finding],
+    waived: usize,
+    warnings: &[String],
+    total_ms: u64,
+    gate: Option<i32>,
+    no_stack: &NoStack,
+) -> String {
     let mut out = String::new();
     for s in stacks {
-        let counts = counts(findings.iter().filter(|f| f.stack == s.stack));
+        let mut counts = counts(findings.iter().filter(|f| f.stack == s.stack));
+        if !s.unscanned.is_empty() {
+            let _ = write!(counts, ", {} unscanned", s.unscanned.len());
+        }
         let status = match s.status {
             Status::Ok => "ok",
             Status::Skipped => "skipped",
@@ -246,6 +301,15 @@ pub fn summary(stacks: &[StackReport], findings: &[Finding], waived: usize, warn
         }
         out.push_str(line.trim_end());
         out.push('\n');
+    }
+    for s in stacks.iter().filter(|s| s.status == Status::Ok && !s.unscanned.is_empty()) {
+        let first: Vec<String> = s.unscanned.iter().take(3).map(|(f, why)| format!("{f}: {}", why.chars().take(80).collect::<String>())).collect();
+        let more = if s.unscanned.len() > 3 { format!("; {} more", s.unscanned.len() - 3) } else { String::new() };
+        let _ = writeln!(out, "modern-tara: {} unscanned: {}{more}", s.stack, first.join("; "));
+    }
+    if !no_stack.is_empty() {
+        let by: Vec<String> = no_stack.iter().map(|(ext, n)| format!("{ext} {n}")).collect();
+        let _ = writeln!(out, "modern-tara: {} changed file(s) match no stack ({})", no_stack.values().sum::<usize>(), by.join(", "));
     }
     for w in warnings {
         let _ = writeln!(out, "modern-tara: warning: {w}");
@@ -261,6 +325,20 @@ pub fn summary(stacks: &[StackReport], findings: &[Finding], waived: usize, warn
         Some(1) => {
             let n = findings.iter().filter(|f| f.stops_gate()).count();
             let _ = writeln!(out, "modern-tara: gate stopped ({n} high-confidence modern findings)");
+        }
+        Some(2) => {
+            let why: Vec<String> = stacks
+                .iter()
+                .filter_map(|s| match s.status {
+                    Status::Error => Some(format!("{} error", s.stack)),
+                    Status::Skipped if s.incomplete() => Some(format!("{} skipped", s.stack)),
+                    _ if s.incomplete() => Some(format!("{} {} unscanned", s.stack, s.unscanned.len())),
+                    _ => None,
+                })
+                .collect();
+            if !why.is_empty() {
+                let _ = writeln!(out, "modern-tara: gate failed ({}; --allow-skipped <stack> accepts skipped or unscanned)", why.join(", "));
+            }
         }
         _ => {}
     }
@@ -298,14 +376,14 @@ mod tests {
         s.newest("python", "3.15");
         s.tool = "ruff 0.17.6".into();
         let f = vec![finding("a.py", 3, Kind::Modern), finding("a.py", 4, Kind::NeedsNewer)];
-        let none = Extras { waived: &[], waivers: &json!({"file": null, "entries": []}), warnings: &[] };
+        let none = Extras { waived: &[], waivers: &json!({"file": null, "entries": []}), warnings: &[], no_stack: &NoStack::new() };
         let doc = document("0.1.0", "C:/r", &json!({"mode": "range"}), &[s], &f, &none);
         assert_eq!(doc["tool"], "modern-tara");
         assert_eq!(doc["waived"], json!([]));
         assert_eq!(doc["waivers"], json!({"file": null, "entries": []}));
         assert_eq!(doc["warnings"], json!([]));
         let stack = &doc["stacks"][0];
-        for key in ["stack", "files", "pins", "newest", "tool", "status", "message", "duration_ms"] {
+        for key in ["stack", "files", "pins", "newest", "tool", "status", "message", "duration_ms", "unscanned", "allowed", "rules"] {
             assert!(stack.get(key).is_some(), "stack.{key}");
         }
         assert_eq!(stack["status"], "ok");
@@ -328,13 +406,50 @@ mod tests {
     fn gate_counts_only_high_confidence_modern() {
         let high = vec![finding("a.py", 1, Kind::Modern), low(finding("a.py", 2, Kind::Modern))];
         let warnings = vec![low(finding("a.py", 2, Kind::Modern)), finding("a.py", 3, Kind::NeedsNewer), finding("a.py", 4, Kind::Baseline)];
-        assert_eq!(exit_code(&high, false, true), 1);
-        assert_eq!(exit_code(&warnings, false, true), 0);
-        assert_eq!(exit_code(&warnings, false, false), 1, "without --gate every finding counts");
-        assert_eq!(exit_code(&warnings, true, true), 2, "a failed stack is a tool error");
-        assert_eq!(exit_code(&high, true, true), 1);
-        assert_eq!(exit_code(&[], false, true), 0);
-        assert_eq!(exit_code(&[], true, false), 2);
+        let ok = [StackReport::new("python", vec!["a.py".into()])];
+        let mut failed = ok.clone();
+        failed[0].fail("boom");
+        assert_eq!(exit_code(&high, &ok, true), 1);
+        assert_eq!(exit_code(&warnings, &ok, true), 0);
+        assert_eq!(exit_code(&warnings, &ok, false), 1, "without --gate every finding counts");
+        assert_eq!(exit_code(&warnings, &failed, true), 2, "a failed stack is a tool error");
+        assert_eq!(exit_code(&high, &failed, true), 1);
+        assert_eq!(exit_code(&[], &ok, true), 0);
+        assert_eq!(exit_code(&[], &failed, false), 2);
+    }
+
+    #[test]
+    fn gate_fails_on_skipped_or_unscanned_unless_allowed() {
+        let mut skipped = StackReport::new("js", vec!["a.js".into(), "b.ts".into()]);
+        skipped.skip("node not found");
+        assert_eq!(skipped.unscanned.len(), 2, "skipped: every touched file is unscanned");
+        let mut partial = StackReport::new("rust", vec!["a.rs".into()]);
+        partial.unscanned("a.rs", "no Cargo.toml above it");
+        let mut empty = StackReport::new("go", Vec::new());
+        empty.skip("go not found");
+        let high = vec![finding("a.py", 1, Kind::Modern)];
+        for s in [&skipped, &partial] {
+            let one = std::slice::from_ref(s);
+            assert_eq!(exit_code(&[], one, true), 2, "{}", s.stack);
+            assert_eq!(exit_code(&[], one, false), 0, "{}: without --gate only reported", s.stack);
+            assert_eq!(exit_code(&high, one, true), 1, "findings that stop the gate come first");
+            let mut allowed = s.clone();
+            allowed.allowed = true;
+            assert_eq!(exit_code(&[], &[allowed], true), 0);
+        }
+        assert_eq!(exit_code(&[], &[empty], true), 0, "a stack with no touched file never fails");
+        let mut error = StackReport::new("css", vec!["a.css".into()]);
+        error.fail("stylelint crashed");
+        error.allowed = true;
+        assert_eq!(exit_code(&[], &[error], true), 2, "--allow-skipped never covers an error");
+
+        let text = summary(&[skipped.clone(), partial.clone()], &[], 0, &[], 10, Some(2), &NoStack::from([("html".into(), 2)]));
+        assert!(text.contains("no findings, 2 unscanned"), "{text}");
+        assert!(text.contains("modern-tara: rust unscanned: a.rs: no Cargo.toml above it\n"), "{text}");
+        assert!(text.contains("modern-tara: 2 changed file(s) match no stack (html 2)\n"), "{text}");
+        assert!(text.ends_with("modern-tara: gate failed (js skipped, rust 1 unscanned; --allow-skipped <stack> accepts skipped or unscanned)\n"), "{text}");
+        let json = partial.to_json();
+        assert_eq!(json["unscanned"], json!([{"file": "a.rs", "reason": "no Cargo.toml above it"}]));
     }
 
     #[test]
@@ -346,13 +461,13 @@ mod tests {
             low(finding("a.py", 3, Kind::Modern)),
             finding("a.py", 4, Kind::NeedsNewer),
         ];
-        let text = summary(std::slice::from_ref(&s), &f, 0, &[], 1500, Some(1));
+        let text = summary(std::slice::from_ref(&s), &f, 0, &[], 1500, Some(1), &NoStack::new());
         assert!(text.contains("2 modern high, 1 modern low, 1 needs-newer high"), "{text}");
         assert!(text.contains("modern-tara: 4 findings (2 modern high, 1 modern low, 1 needs-newer high) in 1.5s"), "{text}");
         assert!(text.ends_with("modern-tara: gate stopped (2 high-confidence modern findings)\n"), "{text}");
-        let passed = summary(std::slice::from_ref(&s), &f[2..], 0, &[], 0, Some(0));
+        let passed = summary(std::slice::from_ref(&s), &f[2..], 0, &[], 0, Some(0), &NoStack::new());
         assert!(passed.ends_with("modern-tara: gate passed\n"), "{passed}");
-        assert!(!summary(&[s], &[], 0, &[], 0, None).contains("modern-tara: gate"));
+        assert!(!summary(&[s], &[], 0, &[], 0, None, &NoStack::new()).contains("modern-tara: gate"));
         assert_eq!(Confidence::parse("HIGH"), Confidence::High);
         assert_eq!(Confidence::parse(""), Confidence::Low);
     }
@@ -362,15 +477,15 @@ mod tests {
         let s = StackReport::new("python", vec!["a.py".into()]);
         let f = vec![finding("a.py", 1, Kind::Modern), finding("a.py", 2, Kind::NeedsNewer)];
         let warnings = vec!["--files x* matches nothing".to_string(), "waiver 1 (UP006) matched nothing".to_string()];
-        let text = summary(std::slice::from_ref(&s), &f, 2, &warnings, 1200, None);
+        let text = summary(std::slice::from_ref(&s), &f, 2, &warnings, 1200, None, &NoStack::new());
         assert!(text.contains("modern-tara: 2 findings (1 modern high, 1 needs-newer high), 2 waived in 1.2s\n"), "{text}");
         let totals = text.find("modern-tara: 2 findings").unwrap();
         let first = text.find("modern-tara: warning: --files x* matches nothing\n").unwrap();
         let second = text.find("modern-tara: warning: waiver 1 (UP006) matched nothing\n").unwrap();
         assert!(first < second && second < totals, "{text}");
-        let zero = summary(std::slice::from_ref(&s), &[], 2, &[], 1200, None);
+        let zero = summary(std::slice::from_ref(&s), &[], 2, &[], 1200, None, &NoStack::new());
         assert!(zero.ends_with("modern-tara: 0 findings, 2 waived in 1.2s\n"), "{zero}");
-        let none = summary(&[s], &[], 0, &[], 1200, None);
+        let none = summary(&[s], &[], 0, &[], 1200, None, &NoStack::new());
         assert!(none.ends_with("modern-tara: 0 findings in 1.2s\n") && !none.contains("waived"), "{none}");
     }
 

@@ -198,8 +198,14 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
         return report;
     }
     report.tool = format!("PSScriptAnalyzer {} on pwsh {installed}", v.get("pssa").and_then(Value::as_str).unwrap_or("?"));
+    report.ran(RULES);
     for e in v.get("errors").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
         report.note(e.replace(&*dir.to_string_lossy(), ""));
+    }
+    for p in v.get("failed").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+        if let Some(file) = super::rel_to(&dir, p) {
+            report.unscanned(file, "PSScriptAnalyzer failed on it");
+        }
     }
     let results: Vec<Value> = match v.get("results") {
         Some(Value::Array(a)) => a.clone(),
@@ -212,6 +218,16 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
         let rule = r.get("RuleName").and_then(Value::as_str).unwrap_or("").to_string();
         let num = |k: &str| r.get(k).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
         let mut message = r.get("Message").and_then(Value::as_str).unwrap_or("").to_string();
+        // A syntax error comes back as a record: the file is not analysed, never a
+        // finding. A module or type that is not installed here is only a note.
+        if r.get("Severity").and_then(Value::as_str) == Some("ParseError") {
+            if matches!(rule.as_str(), "ModuleNotFoundDuringParse" | "TypeNotFound") {
+                report.note(format!("{file}: {rule}: {message}"));
+            } else {
+                report.unscanned(file, format!("not parsed: {rule}: {message}"));
+            }
+            continue;
+        }
         let compat = rule == "PSUseCompatibleSyntax";
         if compat && host_of.get(&file) == Some(&Host::Unknown) {
             message = format!("If run by Windows PowerShell 5.1: {message}");

@@ -7,11 +7,15 @@ inputs:
     required: false
     default: ""
   range:
-    description: Commits to compare as <a>..<b>. Default is the pull request's merge base..head, else github.event.before..github.sha.
+    description: Commits to compare as <a>..<b>, or <a>...<b> for merge-base(a, b)..b. Default is the pull request's base...head, else github.event.before..github.sha.
     required: false
     default: ""
   args:
     description: More arguments for `modern-tara scan`, split on spaces (for example `--stacks rust,python`).
+    required: false
+    default: ""
+  allow-skipped:
+    description: Stacks (comma-separated, or all) that may be skipped or leave touched files unscanned without failing the gate, passed as `--allow-skipped`. Default is none.
     required: false
     default: ""
   waivers:
@@ -97,6 +101,7 @@ runs:
         MT_RANGE: ${{ inputs.range }}
         MT_ARGS: ${{ inputs.args }}
         MT_WAIVERS: ${{ inputs.waivers }}
+        MT_ALLOW_SKIPPED: ${{ inputs.allow-skipped }}
         MT_PR_BASE: ${{ github.event.pull_request.base.sha }}
         MT_PR_HEAD: ${{ github.event.pull_request.head.sha }}
         MT_BEFORE: ${{ github.event.before }}
@@ -110,9 +115,8 @@ runs:
           if ((git rev-parse --is-shallow-repository) -eq 'true') { git fetch --no-tags --quiet --unshallow origin }
           if ($env:MT_PR_BASE -and $env:MT_PR_HEAD) {
             git fetch --no-tags --quiet origin $env:MT_PR_BASE $env:MT_PR_HEAD
-            $mergeBase = git merge-base $env:MT_PR_BASE $env:MT_PR_HEAD
-            if ($LASTEXITCODE -ne 0 -or -not $mergeBase) { throw 'modern-tara: no merge base between the pull request base and head' }
-            $scope = @('--range', "$mergeBase..$($env:MT_PR_HEAD)")
+            # base...head: modern-tara diffs head against merge-base(base, head).
+            $scope = @('--range', "$($env:MT_PR_BASE)...$($env:MT_PR_HEAD)")
           } else {
             $sha = $env:GITHUB_SHA
             $from = $null
@@ -142,6 +146,7 @@ runs:
           if (-not (Test-Path -LiteralPath $env:MT_WAIVERS -PathType Leaf)) { throw "modern-tara: waivers file '$($env:MT_WAIVERS)' not found in the checkout" }
           $extra += @('--waivers', $env:MT_WAIVERS)
         }
+        if ($env:MT_ALLOW_SKIPPED) { $extra += @('--allow-skipped', $env:MT_ALLOW_SKIPPED) }
         & $env:MT_EXE scan --repo . @scope --gate --json $report @extra 2> $summary
         $code = $LASTEXITCODE
         $text = [string](Get-Content -LiteralPath $summary -Raw -Encoding utf8)

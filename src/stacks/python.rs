@@ -11,7 +11,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-pub const SELECT: &str = "UP,FURB,PTH,SIM";
+/// E902 (io-error) is selected so a file ruff cannot read is reported, not skipped.
+pub const SELECT: &str = "UP,FURB,PTH,SIM,E902";
 /// Oldest target ruff accepts.
 const RUFF_MIN: (u32, u32) = (3, 7);
 
@@ -23,6 +24,7 @@ struct Pin {
     min: Option<(u32, u32)>,
 }
 
+#[expect(clippy::too_many_lines, reason = "one linear pipeline: pins, copy, run, parse")]
 pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
     let mut report = StackReport::new("python", files.to_vec());
     report.newest("python", format!("{}.{}", NEWEST_PYTHON.0, NEWEST_PYTHON.1));
@@ -31,6 +33,7 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
         return report;
     };
     report.tool = super::version_line(&ruff, &["--version"]).unwrap_or_else(|| "ruff".into());
+    report.ran(SELECT.split(','));
 
     let mut groups: BTreeMap<Pin, Vec<String>> = BTreeMap::new();
     for f in files {
@@ -57,10 +60,17 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
         return report;
     }
 
-    for (pin, members) in &groups {
+    for (pin, all) in &groups {
+        // A file too large or unreadable to copy is unscanned by the caller, not a ruff error.
+        let members = &all.iter().filter(|m| copy.join(m).is_file()).cloned().collect::<Vec<_>>();
         let base = pin.min.map_or(NEWEST_PYTHON, |v| v.max(RUFF_MIN).min(NEWEST_PYTHON));
         let base_hits = match ruff_run(ctx, &ruff, &copy, members, base) {
-            Ok(h) => h,
+            Ok((h, broken)) => {
+                for (file, why) in broken {
+                    report.unscanned(file, why);
+                }
+                h
+            }
             Err(e) => {
                 report.fail(e);
                 return report;
@@ -72,7 +82,7 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
         }
         if base < NEWEST_PYTHON {
             let newest_hits = match ruff_run(ctx, &ruff, &copy, members, NEWEST_PYTHON) {
-                Ok(h) => h,
+                Ok((h, _)) => h,
                 Err(e) => {
                     report.note(format!("needs-newer pass failed: {e}"));
                     continue;
@@ -85,7 +95,7 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
             // The first target that shows each extra finding is its upgrade.
             let mut first_seen: HashMap<(String, u32, String), (u32, u32)> = HashMap::new();
             for minor in base.1 + 1..NEWEST_PYTHON.1 {
-                if let Ok(hits) = ruff_run(ctx, &ruff, &copy, members, (3, minor)) {
+                if let Ok((hits, _)) = ruff_run(ctx, &ruff, &copy, members, (3, minor)) {
                     for h in hits {
                         first_seen.entry(h.key()).or_insert((3, minor));
                     }
@@ -107,6 +117,7 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
 
     match astgrep::scan(ctx, &copy, files) {
         Ok(Some(matches)) => {
+            report.ran(astgrep::rule_ids(&ctx.home, "requires-python"));
             for m in matches.into_iter().filter(|m| m.gate == "requires-python") {
                 let pin = pin_for(ctx.change, &m.file);
                 let min = pins::major_minor(&m.min);
@@ -120,7 +131,7 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
             }
         }
         Ok(None) => report.note("ast-grep not found: catalogue rules skipped."),
-        Err(e) => report.note(e),
+        Err(e) => report.fail(e),
     }
     report
 }
@@ -153,40 +164,55 @@ impl Hit {
     }
 }
 
-fn ruff_run(ctx: &Ctx, ruff: &Path, copy: &Path, files: &[String], target: (u32, u32)) -> Result<Vec<Hit>, String> {
+/// The hits, and the files ruff could not parse or read (with the reason).
+/// `--ignore-noqa`: a `# noqa` comment never hides a finding (only
+/// modern-tara.toml waives).
+fn ruff_run(ctx: &Ctx, ruff: &Path, copy: &Path, files: &[String], target: (u32, u32)) -> Result<(Vec<Hit>, BTreeMap<String, String>), String> {
     let mut hits = Vec::new();
-    for chunk in files.chunks(300) {
-        let out = Cmd::new(ruff)
-            .args(["check", "--no-cache", "--isolated", "--exit-zero", "--select", SELECT, "--output-format", "json"])
-            .arg("--target-version")
-            .arg(format!("py{}{}", target.0, target.1))
-            .arg("--")
-            .args(chunk)
-            .cwd(copy)
-            .env("NO_COLOR", "1")
-            .timeout(ctx.timeout_or(120))
-            .run()?;
+    let mut broken = BTreeMap::new();
+    let cmd = Cmd::new(ruff)
+        .args(["check", "--no-cache", "--isolated", "--exit-zero", "--ignore-noqa", "--select", SELECT, "--output-format", "json"])
+        .arg("--target-version")
+        .arg(format!("py{}{}", target.0, target.1))
+        .arg("--")
+        .cwd(copy)
+        .env("NO_COLOR", "1")
+        .timeout(ctx.timeout_or(120));
+    for out in cmd.run_chunked(files)? {
         if out.timed_out {
             return Err("ruff timed out".into());
         }
         if !out.ok() {
             return Err(format!("ruff failed: {}", out.tail(3)));
         }
+        for (file, why) in lint_failures(&out.stderr_text(), files) {
+            broken.entry(file).or_insert_with(|| format!("ruff could not read it: {why}"));
+        }
         let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("ruff output: {e}"))?;
         for item in v.as_array().into_iter().flatten() {
             let Some(file) = item.get("filename").and_then(Value::as_str).and_then(|p| super::rel_to(copy, p)) else { continue };
             let num = |ptr: &str| item.pointer(ptr).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
             let Some(code) = item.get("code").and_then(Value::as_str) else { continue };
-            hits.push(Hit {
-                file,
-                line: num("/location/row"),
-                column: num("/location/column"),
-                code: code.to_string(),
-                message: item.get("message").and_then(Value::as_str).unwrap_or("").to_string(),
-            });
+            let message = item.get("message").and_then(Value::as_str).unwrap_or("");
+            if code == "invalid-syntax" {
+                broken.entry(file).or_insert_with(|| format!("ruff could not parse it: {message} (line {})", num("/location/row")));
+                continue;
+            }
+            if code == "E902" {
+                broken.entry(file).or_insert_with(|| format!("ruff could not read it: {message}"));
+                continue;
+            }
+            hits.push(Hit { file, line: num("/location/row"), column: num("/location/column"), code: code.to_string(), message: message.to_string() });
         }
     }
-    Ok(hits)
+    Ok((hits, broken))
+}
+
+/// `(file, why)` of each `Failed to lint <file>: <why>` line on ruff's stderr
+/// that names one of `files`.
+fn lint_failures(stderr: &str, files: &[String]) -> Vec<(String, String)> {
+    let failures = stderr.lines().filter_map(|l| l.split_once("Failed to lint ")).map(|(_, rest)| rest.replace('\\', "/"));
+    failures.filter_map(|f| files.iter().find_map(|file| f.strip_prefix(&format!("{file}: ")).map(|why| (file.clone(), why.to_string())))).collect()
 }
 
 /// Nearest `pyproject.toml` with `requires-python`, else `.python-version`.
@@ -209,4 +235,17 @@ fn pin_for(change: &Change, file: &str) -> Pin {
         }
     }
     Pin { source: String::new(), spec: "unknown".into(), min: None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lint_failures_name_the_file() {
+        let files = ["a.py".to_string(), "a.pyi".to_string(), "src/b.py".to_string()];
+        let stderr = "warning: Failed to lint src\\b.py: stream did not contain valid UTF-8\nwarning: Failed to lint other.py: x\nwarning: Failed to lint a.pyi: y\nunrelated\n";
+        let named = |f: &str, why: &str| (f.to_string(), why.to_string());
+        assert_eq!(lint_failures(stderr, &files), vec![named("src/b.py", "stream did not contain valid UTF-8"), named("a.pyi", "y")]);
+    }
 }

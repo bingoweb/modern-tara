@@ -10,4 +10,10 @@ fn main() {
     let t = s.strip_prefix("x").unwrap_or(s); // OLD:rust-strip-unwrap-or-trim:needs-newer
     let u = s.trim_end_matches('b'); // DECOY
     println!("{t}{u}");
+    quiet(s);
+}
+
+#[allow(clippy::uninlined_format_args)]
+fn quiet(s: &str) {
+    println!("{}", s); // OLD:uninlined_format_args:modern
 }

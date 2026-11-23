@@ -3,33 +3,41 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub const USAGE: &str = "usage: modern-tara scan [--repo <dir>] [--range <a>..<b> | --staged] [--files <f>...] [--all-lines]
+pub const USAGE: &str = "usage: modern-tara scan [--repo <dir>] [--range <a>..<b> | <a>...<b> | --staged] [--files <f>...] [--all-lines]
                         [--stacks csharp,rust,python,js,css,powershell,go] [--json <out.json>] [--quiet]
-                        [--git-safe] [--timeout <seconds>] [--gate] [--waivers <file> | --no-waivers]
+                        [--git-safe] [--timeout <seconds>] [--gate] [--allow-skipped <stack,...|all>]
+                        [--waivers <file> | --no-waivers]
        modern-tara --version
 
   --range a..b  changed lines of `git diff -U0 a b`, contents from revision b
+  --range a...b the same from merge-base(a, b) to b (what a pull request adds)
   --staged      changes in the index against HEAD
   (neither)     work tree against HEAD, untracked files whole
   --files       only these paths (globs allowed); with --all-lines, whole files,
                 also in a folder that is not a git repository
-  --all-lines   whole files (every tracked file when no --files)
+  --all-lines   whole files; alone: every file (tracked and untracked, not ignored;
+                outside git every file but dependency and build folders)
   --json FILE   write the JSON report to FILE instead of stdout
   --quiet       no summary on stderr
   --git-safe    trust a repository owned by another user (safe.directory, per command)
   --timeout S   per-stack timeout in seconds (defaults: rust 900, csharp 600, js 300, go 600 for the whole stack, others 120-180)
-  --gate        exit 1 only for high-confidence `modern` findings; the others are warnings
+  --gate        exit 1 only for high-confidence `modern` findings; the others are warnings;
+                exit 2 also when a stack with touched files was skipped or left one unscanned
+  --allow-skipped L  with --gate, these stacks (or all) may be skipped or leave files unscanned
   --waivers F   read the waivers from file F instead of modern-tara.toml at the top level
   --no-waivers  ignore waivers (audits); excludes --waivers
 
 exit: 0 no findings, 1 findings, 2 tool error (or a stack failed and nothing was found)
-      with --gate: 1 only for high-confidence `modern` findings, 2 a stack failed and none was found";
+      with --gate: 1 only for high-confidence `modern` findings, 2 a stack failed, was skipped or
+      left a touched file unscanned (unless --allow-skipped names it) and none was found";
 
 #[derive(Debug, Default, Clone)]
 #[expect(clippy::struct_excessive_bools, reason = "one field per command-line switch")]
 pub struct Opts {
     pub repo: PathBuf,
     pub range: Option<(String, String)>,
+    /// `--range a...b`: the diff starts at merge-base(a, b).
+    pub merge_base: bool,
     pub staged: bool,
     pub files: Vec<String>,
     pub all_lines: bool,
@@ -44,12 +52,26 @@ pub struct Opts {
     pub waivers: Option<PathBuf>,
     /// `--no-waivers`: ignore waivers entirely.
     pub no_waivers: bool,
+    /// `--allow-skipped`: stacks that may be skipped or leave files unscanned under `--gate`.
+    pub allow_skipped: Vec<String>,
 }
 
 pub enum Command {
     Scan(Box<Opts>),
     Version,
     Help,
+}
+
+/// A comma-separated list of known stack names; `all` (when allowed) is every stack.
+fn stack_list(v: &str, all: bool) -> Result<Vec<String>, String> {
+    let list: Vec<String> = v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
+    if let Some(s) = list.iter().find(|s| !(crate::stacks::ALL.contains(&s.as_str()) || all && *s == "all")) {
+        return Err(format!("unknown stack: {s} (known: {})", crate::stacks::ALL.join(",")));
+    }
+    if all && list.iter().any(|s| s == "all") {
+        return Ok(crate::stacks::ALL.iter().map(ToString::to_string).collect());
+    }
+    Ok(list)
 }
 
 pub fn parse(args: &[String]) -> Result<Command, String> {
@@ -72,7 +94,10 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             "--repo" => o.repo = PathBuf::from(value(&mut i, a)?),
             "--range" => {
                 let v = value(&mut i, a)?;
-                let (from, to) = v.split_once("..").filter(|(f, t)| !f.is_empty() && !t.is_empty() && !t.starts_with('.')).ok_or("--range wants <a>..<b>")?;
+                o.merge_base = v.contains("...");
+                let sep = if o.merge_base { "..." } else { ".." };
+                let (from, to) =
+                    v.split_once(sep).filter(|(f, t)| !f.is_empty() && !t.is_empty() && !t.starts_with('.')).ok_or("--range wants <a>..<b> or <a>...<b>")?;
                 o.range = Some((from.to_string(), to.to_string()));
             }
             "--staged" => o.staged = true,
@@ -87,16 +112,8 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 let secs: u64 = value(&mut i, a)?.parse().map_err(|_| "--timeout wants seconds")?;
                 o.timeout = Some(Duration::from_secs(secs.max(1)));
             }
-            "--stacks" => {
-                let v = value(&mut i, a)?;
-                let list: Vec<String> = v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
-                for s in &list {
-                    if !crate::stacks::ALL.contains(&s.as_str()) {
-                        return Err(format!("unknown stack: {s} (known: {})", crate::stacks::ALL.join(",")));
-                    }
-                }
-                o.stacks = Some(list);
-            }
+            "--stacks" => o.stacks = Some(stack_list(&value(&mut i, a)?, false)?),
+            "--allow-skipped" => o.allow_skipped = stack_list(&value(&mut i, a)?, true)?,
             "--files" => {
                 while args.get(i + 1).is_some_and(|v| !v.starts_with("--")) {
                     i += 1;
@@ -158,9 +175,28 @@ mod tests {
     }
 
     #[test]
+    fn three_dot_range_and_allow_skipped() {
+        let o = scan(&["scan", "--range", "origin/main...HEAD"]);
+        assert_eq!(o.range, Some(("origin/main".into(), "HEAD".into())));
+        assert!(o.merge_base);
+        let two = scan(&["scan", "--range", "a..b"]);
+        assert!(!two.merge_base && two.range == Some(("a".into(), "b".into())));
+        assert_eq!(scan(&["scan", "--allow-skipped", "JS,rust"]).allow_skipped, vec!["js", "rust"]);
+        assert_eq!(scan(&["scan", "--allow-skipped", "all"]).allow_skipped, crate::stacks::ALL.to_vec());
+        assert_eq!(scan(&["scan"]).allow_skipped, Vec::<String>::new());
+        assert!(USAGE.contains("--allow-skipped") && USAGE.contains("<a>...<b>"));
+    }
+
+    #[test]
     fn bad_options() {
         let bad = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()).is_err();
-        assert!(bad(&["scan", "--range", "a...b"]));
+        assert!(bad(&["scan", "--range", "a....b"]));
+        assert!(bad(&["scan", "--range", "...b"]));
+        assert!(bad(&["scan", "--range", "a..."]));
+        assert!(bad(&["scan", "--allow-skipped", "cobol"]));
+        assert!(bad(&["scan", "--allow-skipped", "all,cobol"]), "every name is checked, also next to all");
+        assert!(bad(&["scan", "--allow-skipped", "cobol,all"]));
+        assert!(bad(&["scan", "--allow-skipped"]));
         assert!(bad(&["scan", "--range", "a.."]));
         assert!(bad(&["scan", "--stacks", "cobol"]));
         assert!(bad(&["scan", "--range", "a..b", "--staged"]));

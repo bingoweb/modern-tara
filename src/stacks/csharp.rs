@@ -134,13 +134,17 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
     if !loose.is_empty() {
         report.note(format!("no .csproj above {} file(s); only catalogue rules ran there.", loose.len()));
     }
+    for f in &loose {
+        report.unscanned(f.clone(), "no .csproj above it: dotnet format did not run (catalogue rules only)");
+    }
     let mut proj_info: BTreeMap<String, Project> = BTreeMap::new();
     for p in projects.keys() {
         let props = effective_props(change, p);
         let tfm = pins::lowest_tfm(&props);
         proj_info.insert(p.clone(), Project { path: p.clone(), props, tfm });
     }
-    if proj_info.values().any(|p| p.tfm.as_ref().is_none_or(|(_, t)| !pins::tfm_at_least(*t, 11, 0))) {
+    // The SDK, not the project's TargetFramework, decides whether the C# 15 checks exist.
+    if !sdk_at_least(&installed, NEWEST_DOTNET.parse().unwrap_or(u32::MAX)) {
         report.note(format!("C# {NEWEST_CSHARP} checks need the .NET {NEWEST_DOTNET} SDK (catalogue only until then)."));
     }
     let mut pin_json = serde_json::Map::new();
@@ -191,9 +195,15 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
                     }
                     report.findings.extend(pass.findings);
                 }
-                Err(e) => report.fail(e),
+                Err(e) => {
+                    for f in &tool_files {
+                        report.unscanned(f.clone(), "dotnet format did not finish");
+                    }
+                    report.fail(e);
+                }
             }
         }
+        report.ran(style_ids.iter().chain(&analyzer_ids).copied());
         copy_style = copies.into_iter().next();
     }
 
@@ -210,6 +220,7 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
     let _ = change.materialize(&catalogue_dir, &loose);
     match astgrep::scan(ctx, &catalogue_dir, files) {
         Ok(Some(matches)) => {
+            report.ran(astgrep::rule_ids(&ctx.home, "TargetFramework"));
             for m in matches.into_iter().filter(|m| m.gate == "TargetFramework") {
                 let project = projects.iter().find(|(_, fs)| fs.contains(&m.file)).map(|(p, _)| p.clone());
                 let tfm = project.as_ref().and_then(|p| proj_info.get(p)).and_then(|p| p.tfm.clone());
@@ -221,8 +232,9 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
             }
         }
         Ok(None) => report.note("ast-grep not found: catalogue rules skipped."),
-        Err(e) => report.note(e),
+        Err(e) => report.fail(e),
     }
+    drop_doubled_ide0090(&mut report.findings);
     report
 }
 
@@ -360,7 +372,10 @@ fn format_pass(ctx: &Ctx, dotnet: &Path, copy: &Path, sub: &str, ids: &[&str], f
         .arg("--report")
         .arg(&report_dir)
         .timeout(ctx.timeout_or(600));
-    let with_include = cmd.line_len() + files.iter().map(|f| f.len() + 3).sum::<usize>() < 30_000;
+    // A list too long for one command line: the whole solution is formatted
+    // instead (one workspace load; findings are cut to the changed lines later).
+    let include_len: usize = files.iter().map(|f| crate::proc::arg_len(f.as_ref())).sum();
+    let with_include = cmd.line_len() + include_len + 12 < crate::proc::MAX_LINE;
     if with_include {
         cmd = cmd.arg("--include").args(files);
     }
@@ -403,4 +418,66 @@ fn format_pass(ctx: &Ctx, dotnet: &Path, copy: &Path, sub: &str, ids: &[&str], f
         notes.push(format!("dotnet format {sub}: MSBuild reported warnings while loading the projects."));
     }
     Ok(Pass { findings, notes })
+}
+
+/// Whether `dotnet --list-sdks` names an SDK of this major version or newer.
+pub fn sdk_at_least(installed: &[String], major: u32) -> bool {
+    installed.iter().any(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| m >= major))
+}
+
+/// Drops each IDE0090 (target-typed `new()`) finding on a file and line
+/// another finding already reports at least as strongly (a low-confidence
+/// one never takes a gate stop away).
+fn drop_doubled_ide0090(findings: &mut Vec<Finding>) {
+    let others: BTreeSet<(String, u32, bool)> = findings.iter().filter(|f| f.rule != "IDE0090").map(|f| (f.file.clone(), f.line, f.stops_gate())).collect();
+    let covered = |f: &Finding, stops: bool| others.contains(&(f.file.clone(), f.line, stops));
+    findings.retain(|f| f.rule != "IDE0090" || !(covered(f, true) || !f.stops_gate() && covered(f, false)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::Confidence;
+
+    fn finding(rule: &str, line: u32, source: &'static str) -> Finding {
+        Finding {
+            stack: "csharp",
+            file: "A.cs".into(),
+            line,
+            column: 5,
+            rule: rule.into(),
+            message: String::new(),
+            kind: Kind::Modern,
+            confidence: Confidence::High,
+            source,
+            upgrade: None,
+        }
+    }
+
+    #[test]
+    fn installed_sdk_decides_the_csharp_15_note() {
+        let list = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(sdk_at_least(&list(&["10.0.404", "11.0.100"]), 11));
+        assert!(sdk_at_least(&list(&["12.0.100-preview.1.26101.1"]), 11));
+        assert!(!sdk_at_least(&list(&["8.0.400", "10.0.404"]), 11));
+        assert!(!sdk_at_least(&[], 11));
+    }
+
+    #[test]
+    fn ide0090_is_dropped_where_another_finding_reports_the_line() {
+        let mut v = vec![
+            finding("IDE0090", 3, "tool"),
+            finding("IDE0028", 3, "tool"),
+            finding("IDE0090", 4, "tool"),
+            finding("csharp-new-random", 4, "ast-grep"),
+            finding("IDE0090", 7, "tool"),
+            finding("IDE0090", 7, "tool"),
+            // A low-confidence finding must not take the gate stop away.
+            finding("IDE0090", 9, "tool"),
+            Finding { confidence: Confidence::Low, ..finding("csharp-new-random", 9, "ast-grep") },
+        ];
+        drop_doubled_ide0090(&mut v);
+        let left: Vec<(&str, u32)> = v.iter().map(|f| (f.rule.as_str(), f.line)).collect();
+        assert_eq!(left, vec![("IDE0028", 3), ("csharp-new-random", 4), ("IDE0090", 7), ("IDE0090", 7), ("IDE0090", 9), ("csharp-new-random", 9)]);
+    }
 }

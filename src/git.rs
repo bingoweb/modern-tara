@@ -115,6 +115,38 @@ impl Git {
         self.list(&["ls-files", "-z", "--others", "--exclude-standard"])
     }
 
+    /// The `paths` that are blobs of at most `max` bytes under `prefix`
+    /// (`rev:` or `:`), from one `cat-file --batch-check` (no contents read).
+    pub fn blobs_within<'a>(&self, prefix: &str, paths: &[&'a String], max: usize) -> Result<Vec<&'a String>, String> {
+        let specs: Vec<&String> = paths.iter().copied().filter(|p| !p.contains('\n')).collect();
+        if specs.is_empty() {
+            return Ok(specs);
+        }
+        let request: Vec<u8> = specs.iter().flat_map(|p| format!("{prefix}{p}\n").into_bytes()).collect();
+        let check = self.cmd().args(["cat-file", "--batch-check"]).stdin(request).run()?;
+        let sizes = String::from_utf8_lossy(&check.stdout).into_owned();
+        Ok(specs
+            .into_iter()
+            .zip(sizes.lines())
+            .filter(|(_, line)| {
+                let parts: Vec<&str> = line.split(' ').collect();
+                parts.len() == 3 && parts[1] == "blob" && parts[2].parse::<usize>().is_ok_and(|n| n <= max)
+            })
+            .map(|(p, _)| p)
+            .collect())
+    }
+
+    /// The best common ancestor of two commits (`--range a...b`).
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<String, String> {
+        let out = self.cmd().args(["merge-base", a, b]).run()?;
+        // Exit 1 with nothing printed: the histories share no commit.
+        if out.code == Some(1) && out.tail(1).is_empty() {
+            return Err(format!("no common ancestor of {a} and {b} (unrelated histories): use {a}..{b}"));
+        }
+        let out = if out.ok() { out } else { self.run(&["merge-base", a, b])? };
+        out.stdout_text().lines().next().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).ok_or_else(|| format!("no merge base of {a} and {b}"))
+    }
+
     /// Blob contents for `<prefix><path>` specs (`rev:` or `:` for the index).
     /// `cat-file --batch-check` first, so blobs above `max` bytes are never
     /// read; then one `cat-file --batch`. Missing objects are left out.
@@ -125,17 +157,7 @@ impl Git {
             return Ok(found);
         }
         let request = |list: &[&String]| -> Vec<u8> { list.iter().flat_map(|p| format!("{prefix}{p}\n").into_bytes()).collect() };
-        let check = self.cmd().args(["cat-file", "--batch-check"]).stdin(request(&specs)).run()?;
-        let sizes = String::from_utf8_lossy(&check.stdout).into_owned();
-        let wanted: Vec<&String> = specs
-            .iter()
-            .zip(sizes.lines())
-            .filter(|(_, line)| {
-                let parts: Vec<&str> = line.split(' ').collect();
-                parts.len() == 3 && parts[1] == "blob" && parts[2].parse::<usize>().is_ok_and(|n| n <= max)
-            })
-            .map(|(p, _)| *p)
-            .collect();
+        let wanted = self.blobs_within(prefix, &specs, max)?;
         if wanted.is_empty() {
             return Ok(found);
         }
@@ -297,6 +319,30 @@ mod tests {
         assert_eq!(top_path("C:/src/repo\n").unwrap().to_string_lossy(), "C:/src/repo");
         assert_eq!(top_path("  \n"), None);
     }
+    #[test]
+    fn merge_base_of_unrelated_histories_says_so() {
+        let dir = std::env::temp_dir().join(format!("usta-mt-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q", "-b", "a"]);
+        git(&["commit", "-q", "--allow-empty", "--no-verify", "-m", "one"]);
+        git(&["checkout", "-q", "--orphan", "b"]);
+        git(&["commit", "-q", "--allow-empty", "--no-verify", "-m", "two"]);
+        let repo = Git { exe: PathBuf::from("git"), repo: dir.clone(), safe: false };
+        let err = repo.merge_base("a", "b").unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(err, "no common ancestor of a and b (unrelated histories): use a..b");
+    }
+
     #[test]
     fn adds_and_counts() {
         let d = "diff --git a/x.rs b/x.rs\nindex 1..2 100644\n--- a/x.rs\n+++ b/x.rs\n@@ -2 +2 @@ fn a\n-old\n+new\n@@ -3,0 +4,3 @@\n+a\n+b\n+c\n";

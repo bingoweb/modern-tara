@@ -26,3 +26,11 @@ pub fn request_timeout(minutes: u64) -> Duration {
 pub fn short_timeout() -> Duration {
     Duration::from_secs(5) // DECOY
 }
+
+pub fn seconds(minutes: u64) -> u64 {
+    minutes * 60 // DECOY
+}
+
+pub fn hourly(hours: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(3600 * hours) // OLD:rust-duration-from-mins-hours:needs-newer
+}

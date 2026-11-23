@@ -231,9 +231,21 @@ fn rust_raised_pass_fixture() {
     assert!(message.contains("raised copy (edition 2024, rust-version 1.100) compiled"), "{message}");
 }
 
+/// The csharp fixture targets net8.0; with SDK 11 installed the stack must
+/// not claim the .NET 11 SDK is missing. A8: the report lists the IDE/CA ids.
 #[test]
 fn csharp_fixture() {
-    check("csharp");
+    let Some(report) = check_fixture("csharp", "csharp") else { return };
+    let sdks = Command::new(installed("dotnet").unwrap()).arg("--list-sdks").output().unwrap();
+    let has_11 = String::from_utf8_lossy(&sdks.stdout).lines().any(|l| l.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| m >= 11));
+    let message = report["message"].as_str().unwrap();
+    if has_11 {
+        assert!(!message.contains("need the .NET 11 SDK"), "SDK 11 is installed: {message}");
+    }
+    let rules: Vec<&str> = report["rules"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    for id in ["IDE0090", "IDE0300", "CA1510", "SYSLIB1045", "csharp-new-random"] {
+        assert!(rules.contains(&id), "{id} in {rules:?}");
+    }
 }
 
 #[test]
@@ -241,9 +253,31 @@ fn js_and_ts_fixture() {
     check("js");
 }
 
+/// css/prefer-logical-properties: high only for horizontal physical
+/// properties and `text-align: left|right`; `left`/`right` low; `width`, `top`, `vh` dropped;
+/// other values (`float: left`) low.
 #[test]
 fn css_fixture() {
-    check("css");
+    let Some((report, v)) = check_fixture_doc("css", "css") else { return };
+    let line = |n: u64| -> Vec<(String, String)> {
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["line"] == n)
+            .map(|f| (f["rule"].as_str().unwrap().to_string(), f["confidence"].as_str().unwrap().to_string()))
+            .collect()
+    };
+    let logical = "css/prefer-logical-properties".to_string();
+    assert_eq!(line(12), vec![(logical.clone(), "high".to_string())], "{v}");
+    // `right: 0` (a positioned box's inset) only warns.
+    let (high, low) = ((logical.clone(), "high".to_string()), (logical.clone(), "low".to_string()));
+    assert_eq!(line(13), vec![high.clone(), high, low], "{v}");
+    assert_eq!(line(14), vec![(logical, "low".to_string())], "{v}");
+    let rules: Vec<&str> = report["rules"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    for id in ["css/prefer-logical-properties", "color-function-notation", "plugin/use-baseline"] {
+        assert!(rules.contains(&id), "{id} in {rules:?}");
+    }
 }
 
 #[test]
@@ -508,6 +542,50 @@ fn go_vendored_change_does_not_stop_the_gate() {
     }
     assert!(v["findings"].as_array().unwrap().is_empty(), "{v}");
     assert_eq!(code, 0, "{v}");
+}
+
+/// A changed file only a build tag or another GOOS includes is analysed by an
+/// extra pass (`-tags`, `GOOS=freebsd`), never left unscanned; `ignore` stays out.
+#[test]
+fn go_files_behind_tags_or_other_goos_are_analysed() {
+    let any = |pkg: &str| format!("package {pkg}\n\nfunc F(v interface{{}}) {{}}\n");
+    let r = files_repo(
+        "go-tags",
+        &[("go.mod", "module example.com/t\n\ngo 1.21\n"), ("a.go", "package t\n")],
+        &[
+            ("it/it.go", &format!("//go:build integration\n\n{}", any("it"))),
+            ("tools/tools.go", &format!("//go:build tools\n\n{}", any("tools"))),
+            ("bsd/x_freebsd.go", &any("bsd")),
+            ("gen/gen.go", &format!("//go:build ignore\n\n{}", any("main"))),
+        ],
+    );
+    let (code, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go", "--gate"]);
+    let Some(report) = go_report(&v) else { return };
+    assert_eq!(report["status"], "ok", "{}", report["message"]);
+    for file in ["it/it.go", "tools/tools.go", "bsd/x_freebsd.go"] {
+        assert!(v["findings"].as_array().unwrap().iter().any(|f| f["file"] == file && f["rule"] == "go/any"), "{file}: {v}");
+    }
+    assert_eq!(unscanned(&v, "go"), vec![], "{v}");
+    assert_eq!(code, 1, "findings, not a false stop: {v}");
+}
+
+/// More than three extra (GOOS, tags) passes per module: the files beyond the
+/// cap are unscanned and the reason says so.
+#[test]
+fn go_extra_passes_are_capped_at_three() {
+    let any = |tag: &str| format!("//go:build {tag}\n\npackage t\n\nfunc F{tag}(v interface{{}}) {{}}\n");
+    let files: Vec<(String, String)> = (1..=4).map(|i| (format!("t{i}.go"), any(&format!("t{i}")))).collect();
+    let change: Vec<(&str, &str)> = files.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let r = files_repo("go-cap", &[("go.mod", "module example.com/c\n\ngo 1.21\n"), ("a.go", "package t\n")], &change);
+    let (_, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go", "--gate"]);
+    let Some(report) = go_report(&v) else { return };
+    assert_eq!(report["status"], "ok", "{}", report["message"]);
+    let list = unscanned(&v, "go");
+    assert_eq!(list.len(), 1, "{v}");
+    assert_eq!(list[0].0, "t4.go");
+    assert!(list[0].1.contains("more than 3 extra"), "{list:?}");
+    let analysed = v["findings"].as_array().unwrap().iter().filter(|f| f["rule"] == "go/any").count();
+    assert_eq!(analysed, 3, "{v}");
 }
 
 /// A go line newer than the toolchain is an error with the reason, never a download.
@@ -1076,4 +1154,548 @@ fn no_personal_paths_or_user_names() {
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// `scan` with another tool home (`MODERN_TARA_HOME`); also returns stderr.
+fn scan_home(dir: &Path, home: &Path, extra: &[&str]) -> (i32, Value, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_modern-tara"))
+        .arg("scan")
+        .arg("--repo")
+        .arg(dir)
+        .args(extra)
+        .env("MODERN_TARA_CACHE", cache_for(dir))
+        .env("MODERN_TARA_HOME", home)
+        .output()
+        .expect("modern-tara");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("bad JSON ({e}): {stderr}"));
+    (out.status.code().unwrap_or(-1), v, stderr)
+}
+
+fn own_home() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// A tool home with `sgconfig.yml`, `rules/` (plus `extra_rule` as
+/// `rules/extra.yml` when given) and the `js/*.mjs` drivers, but no
+/// `js/node_modules`: the js and css stacks are `skipped` there.
+fn bare_home(name: &str, extra_rule: Option<&str>) -> TempRepo {
+    let home = std::env::temp_dir().join(format!("mt-test-home-{name}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(home.join("rules")).unwrap();
+    fs::create_dir_all(home.join("js")).unwrap();
+    fs::copy(own_home().join("sgconfig.yml"), home.join("sgconfig.yml")).unwrap();
+    copy_tree(&own_home().join("rules"), &home.join("rules"));
+    for f in ["modern-tara.mjs", "modern-tara.eslint.mjs", "modern-tara.stylelint.mjs"] {
+        fs::copy(own_home().join("js").join(f), home.join("js").join(f)).unwrap();
+    }
+    if let Some(rule) = extra_rule {
+        fs::write(home.join("rules").join("extra.yml"), rule).unwrap();
+    }
+    TempRepo(home)
+}
+
+fn stack_of<'a>(v: &'a Value, stack: &str) -> &'a Value {
+    v["stacks"].as_array().unwrap().iter().find(|s| s["stack"] == stack).unwrap_or_else(|| panic!("no {stack} report: {v}"))
+}
+
+/// `(file, reason)` of a stack's unscanned files.
+fn unscanned(v: &Value, stack: &str) -> Vec<(String, String)> {
+    stack_of(v, stack)["unscanned"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{stack}: no unscanned list: {v}"))
+        .iter()
+        .map(|u| (u["file"].as_str().unwrap().to_string(), u["reason"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+fn rule_list(v: &Value, stack: &str) -> Vec<String> {
+    stack_of(v, stack)["rules"].as_array().unwrap_or_else(|| panic!("{stack}: no rules: {v}")).iter().map(|r| r.as_str().unwrap().to_string()).collect()
+}
+
+/// A3: a skipped stack with touched files fails the gate (exit 2) unless
+/// `--allow-skipped` names it; without `--gate` the exit stays 0.
+#[test]
+fn gate_fails_on_a_skipped_stack_unless_allowed() {
+    let r = plain_repo("gate-skip", &[("package.json", "{\"name\":\"s\",\"private\":true}\n"), ("app.js", "const a = 1;\nconsole.log(a);\n")]);
+    let home = bare_home("skip", None);
+    let (code, v, stderr) = scan_home(&r.0, &home.0, &["--all-lines", "--stacks", "js", "--gate"]);
+    assert_eq!(stack_of(&v, "js")["status"], "skipped", "{v}");
+    assert_eq!(code, 2, "a skipped stack with a touched file is no pass: {stderr}");
+    let list = unscanned(&v, "js");
+    assert_eq!(list.len(), 1, "{v}");
+    assert_eq!(list[0].0, "app.js");
+    assert!(list[0].1.contains("eslint is not installed"), "{list:?}");
+    assert!(stderr.contains("1 unscanned"), "{stderr}");
+    for allow in ["js", "all", "python,js"] {
+        let (code, v, stderr) = scan_home(&r.0, &home.0, &["--all-lines", "--stacks", "js", "--gate", "--allow-skipped", allow]);
+        assert_eq!(code, 0, "--allow-skipped {allow}: {stderr}");
+        assert_eq!(stack_of(&v, "js")["allowed"], true, "{v}");
+    }
+    let (code, _, _) = scan_home(&r.0, &home.0, &["--all-lines", "--stacks", "js", "--gate", "--allow-skipped", "python"]);
+    assert_eq!(code, 2, "another stack's allowance does not cover js");
+    let (code, _, _) = scan_home(&r.0, &home.0, &["--all-lines", "--stacks", "js"]);
+    assert_eq!(code, 0, "without --gate a skipped stack keeps exit 0");
+    let out = Command::new(env!("CARGO_BIN_EXE_modern-tara")).args(["scan", "--all-lines", "--allow-skipped", "cobol"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown stack: cobol"));
+}
+
+/// A3: a `.rs` file with no Cargo.toml above it is unscanned by clippy:
+/// the gate fails and the report says why. Files no stack scans are
+/// counted, never a failure; a stack with no touched file never fails.
+#[test]
+fn gate_fails_on_an_unscanned_file_and_lists_it() {
+    if installed("cargo").is_none() {
+        return;
+    }
+    let r = plain_repo("gate-loose", &[("scripts/tool.rs", "fn main() {}\n"), ("notes.html", "<p>x</p>\n"), ("site.scss", "a { b: c; }\n"), ("README", "x\n")]);
+    let (code, v, stderr) = scan_home(&r.0, own_home(), &["--all-lines", "--gate"]);
+    let list = unscanned(&v, "rust");
+    assert_eq!(list.len(), 1, "{v}");
+    assert_eq!(list[0].0, "scripts/tool.rs");
+    assert!(list[0].1.contains("Cargo.toml"), "{list:?}");
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("1 unscanned"), "{stderr}");
+    assert_eq!(v["no_stack"]["files"], 3, "{v}");
+    assert_eq!(v["no_stack"]["extensions"], serde_json::json!({"(none)": 1, "html": 1, "scss": 1}), "{v}");
+    assert!(stderr.contains("3 changed file(s) match no stack"), "{stderr}");
+    let (code, _, _) = scan_home(&r.0, own_home(), &["--all-lines", "--gate", "--allow-skipped", "rust"]);
+    assert_eq!(code, 0);
+    let (code, _, _) = scan_home(&r.0, own_home(), &["--all-lines"]);
+    assert_eq!(code, 0, "without --gate unscanned files are reported only");
+    let (code, v, _) = scan_home(&r.0, own_home(), &["--all-lines", "--gate", "--stacks", "python"]);
+    assert_eq!(code, 0, "only no-stack files and an unselected stack: {v}");
+}
+
+/// A3: an `ESLint` fatal parse error and a ruff syntax error are unscanned
+/// files, not clean ones (and never a finding).
+#[test]
+fn parse_errors_are_unscanned_files() {
+    let r = plain_repo(
+        "parse-err",
+        &[
+            ("package.json", "{\"name\":\"p\",\"private\":true,\"type\":\"module\"}\n"),
+            ("broken.js", "const = ;\n"),
+            ("fine.js", "var x = 1;\nconsole.log(x);\n"),
+            ("bad.py", "import os\nx = os.path.join('a', 'b')\ndef (:\n"),
+            ("broken.ps1", "function f {\n  Get-Date\n"),
+        ],
+    );
+    let (code, v) = scan(&r.0, &["--all-lines", "--stacks", "js,python,powershell", "--gate"]);
+    if stack_of(&v, "powershell")["status"] == "ok" {
+        let list = unscanned(&v, "powershell");
+        assert_eq!(list.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), vec!["broken.ps1"], "{v}");
+        assert!(findings_in(&v, "broken.ps1").is_empty(), "a parse error is never a finding: {v}");
+    }
+    if stack_of(&v, "js")["status"] == "ok" {
+        let list = unscanned(&v, "js");
+        assert_eq!(list.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), vec!["broken.js"], "{v}");
+        assert!(list[0].1.contains("not parsed"), "{list:?}");
+    }
+    if stack_of(&v, "python")["status"] == "ok" {
+        let list = unscanned(&v, "python");
+        assert_eq!(list.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), vec!["bad.py"], "{v}");
+        assert!(v["findings"].as_array().unwrap().iter().all(|f| f["rule"] != "invalid-syntax"), "{v}");
+    }
+    // `var` in fine.js is a high modern finding: 1 comes before 2.
+    assert_eq!(code, 1, "{v}");
+}
+
+/// A3: a broken ast-grep rule file makes the stack an error, never clean.
+#[test]
+fn broken_ast_grep_rule_is_a_stack_error() {
+    if installed("ast-grep").is_none() || installed("ruff").is_none() {
+        return;
+    }
+    let home = bare_home("badrule", Some("id: broken\nlanguage: python\nrule:\n  patern: x\n"));
+    let r = python_repo("sg-broken", ">=3.12", "x = 1\n");
+    let (code, v, stderr) = scan_home(&r.0, &home.0, &["--all-lines", "--stacks", "python"]);
+    let report = stack_of(&v, "python");
+    assert_eq!(report["status"], "error", "{v}");
+    assert!(report["message"].as_str().unwrap().contains("ast-grep"), "{v}");
+    assert_eq!(code, 2, "{stderr}");
+}
+
+/// A3: `--all-lines` alone in a plain folder scans every file, build and
+/// dependency folders left out; in a git repository also untracked files
+/// that are not ignored.
+#[test]
+fn all_lines_alone_scans_every_file() {
+    let dir = std::env::temp_dir().join(format!("mt-test-alldir-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let _ = fs::remove_dir_all(&dir);
+    let guard = TempRepo(dir.clone());
+    for f in [
+        "a.py",
+        "sub/b.py",
+        "node_modules/m.py",
+        "dist/d.py",
+        "build/x.py",
+        ".venv/v.py",
+        "__pycache__/c.py",
+        "target/t.py",
+        "obj/o.py",
+        "bin/k.py",
+        "src/bin/s.py",
+    ] {
+        let p = dir.join(f);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, OLD_JOIN).unwrap();
+    }
+    let (code, v) = scan(&guard.0, &["--all-lines", "--stacks", "python"]);
+    assert_eq!(stack_of(&v, "python")["files"], serde_json::json!(["a.py", "src/bin/s.py", "sub/b.py"]), "{v}");
+    if stack_of(&v, "python")["status"] == "ok" {
+        assert_eq!(code, 1, "{v}");
+    }
+
+    let r = python_repo_with("all-untracked", ">=3.12", "x = 1\n", &[(".gitignore", "ignored.py\n")]);
+    fs::write(r.0.join("new.py"), OLD_JOIN).unwrap();
+    fs::write(r.0.join("ignored.py"), OLD_JOIN).unwrap();
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "python"]);
+    assert_eq!(stack_of(&v, "python")["files"], serde_json::json!(["app.py", "new.py"]), "{v}");
+}
+
+/// A7: a member crate of a workspace whose root is also a package is
+/// linted; A8: the report lists the lints and catalogue rules that ran.
+#[test]
+fn rust_lints_workspace_members() {
+    if installed("cargo").is_none() {
+        return;
+    }
+    let r = plain_repo(
+        "rust-ws",
+        &[
+            ("Cargo.toml", "[package]\nname = \"wsroot\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\nmembers = [\"member\"]\n"),
+            ("src/main.rs", "fn main() {}\n"),
+            ("member/Cargo.toml", "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+            ("member/src/lib.rs", "pub fn show(s: &str) {\n    println!(\"{}\", s);\n}\n"),
+        ],
+    );
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "rust"]);
+    let report = stack_of(&v, "rust");
+    if report["status"] == "skipped" {
+        return;
+    }
+    assert_eq!(report["status"], "ok", "{v}");
+    assert!(findings_in(&v, "member/src/lib.rs").contains(&("clippy::uninlined_format_args".to_string(), 2)), "{v}");
+    let rules = rule_list(&v, "rust");
+    for r in ["clippy::uninlined_format_args", "clippy::manual_*", "clippy::map_unwrap_or", "rust-oncelock-static-lazylock"] {
+        assert!(rules.iter().any(|x| x == r), "{r} in {rules:?}");
+    }
+}
+
+/// A7: inline suppressions do not hide findings: `# noqa` (ruff) and
+/// `eslint-disable` comments; only modern-tara.toml waives.
+#[test]
+fn inline_suppressions_do_not_hide_findings() {
+    let r = plain_repo(
+        "suppress",
+        &[
+            ("pyproject.toml", "[project]\nname = \"s\"\nversion = \"0\"\nrequires-python = \">=3.12\"\n"),
+            ("app.py", "import os\n\nx = os.path.join('a', 'b')  # noqa: PTH118\ny = os.path.join('c', 'd')  # noqa\n"),
+            ("package.json", "{\"name\":\"s\",\"private\":true,\"type\":\"module\"}\n"),
+            ("a.js", "/* eslint-disable */\nvar a = 1;\n// eslint-disable-next-line no-var\nvar b = 2;\nconsole.log(a, b);\n"),
+        ],
+    );
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "python,js"]);
+    if stack_of(&v, "python")["status"] == "ok" {
+        let lines: Vec<u64> = findings_in(&v, "app.py").into_iter().filter(|(rule, _)| rule == JOIN_RULE).map(|(_, l)| l).collect();
+        assert_eq!(lines, vec![3, 4], "{v}");
+        let rules = rule_list(&v, "python");
+        for r in ["UP", "FURB", "PTH", "SIM", "python-asyncio-gather"] {
+            assert!(rules.iter().any(|x| x == r), "{r} in {rules:?}");
+        }
+    }
+    if stack_of(&v, "js")["status"] == "ok" {
+        let lines: Vec<u64> = findings_in(&v, "a.js").into_iter().filter(|(rule, _)| rule == "no-var").map(|(_, l)| l).collect();
+        assert_eq!(lines, vec![2, 4], "{v}");
+        let rules = rule_list(&v, "js");
+        for r in ["no-var", "unicorn/prefer-at", "object-shorthand", "javascript-http-client-package"] {
+            assert!(rules.iter().any(|x| x == r), "{r} in {rules:?}");
+        }
+    }
+}
+
+/// A7: `--range a...b` diffs b against merge-base(a, b): a change made on
+/// `a` after the fork is not part of it; `a..b` stays a plain diff.
+#[test]
+fn range_with_three_dots_uses_the_merge_base() {
+    let r = python_repo("three-dots", ">=3.12", "x = 1\n");
+    git(&r.0, &["checkout", "-q", "-b", "topic"]);
+    fs::write(r.0.join("topic.py"), OLD_JOIN).unwrap();
+    git(&r.0, &["add", "-A"]);
+    git(&r.0, &["commit", "-q", "--no-verify", "-m", "topic"]);
+    git(&r.0, &["checkout", "-q", "main"]);
+    fs::write(r.0.join("app.py"), OLD_JOIN).unwrap();
+    git(&r.0, &["add", "-A"]);
+    git(&r.0, &["commit", "-q", "--no-verify", "-m", "main moves on"]);
+    let (_, v) = scan(&r.0, &["--range", "main...topic", "--stacks", "python"]);
+    assert_eq!(stack_of(&v, "python")["files"], serde_json::json!(["topic.py"]), "{v}");
+    assert_eq!((v["change"]["mode"].as_str(), v["change"]["merge_base"].as_bool()), (Some("range"), Some(true)));
+    let (_, v) = scan(&r.0, &["--range", "main..topic", "--stacks", "python"]);
+    assert_eq!(stack_of(&v, "python")["files"], serde_json::json!(["app.py", "topic.py"]), "{v}");
+    // Unrelated histories: the hint names the revisions as typed, not their hashes.
+    git(&r.0, &["checkout", "-q", "--orphan", "other"]);
+    git(&r.0, &["commit", "-q", "--allow-empty", "--no-verify", "-m", "orphan"]);
+    let out = Command::new(env!("CARGO_BIN_EXE_modern-tara")).args(["scan", "--quiet", "--range", "main...other", "--repo"]).arg(&r.0).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("no common ancestor of main and other (unrelated histories): use main..other"), "{stderr}");
+}
+
+/// A7: ~600 long paths run in chunks; one command line would be over the
+/// Windows limit (os error 206).
+#[test]
+fn long_file_lists_are_chunked() {
+    let deep = format!("{}/{}", "d".repeat(60), "e".repeat(60));
+    let files: Vec<(String, &str)> = (0..600).map(|i| (format!("{deep}/module_with_a_long_name_{i:04}.py"), OLD_JOIN)).collect();
+    let refs: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+    let r = plain_repo("chunks", &refs);
+    let (code, v) = scan(&r.0, &["--all-lines", "--stacks", "python"]);
+    let report = stack_of(&v, "python");
+    if report["status"] == "skipped" {
+        return;
+    }
+    assert_eq!(report["status"], "ok", "{}", report["message"]);
+    let found = v["findings"].as_array().unwrap().iter().filter(|f| f["rule"] == JOIN_RULE).count();
+    assert_eq!(found, 600, "{}", report["message"]);
+    assert_eq!(code, 1);
+}
+
+/// Modern CSS @eslint/css rejects as a syntax error (`@custom-variant`,
+/// `@import ... source(none)`, CSS `if()`) does not make the file unscanned,
+/// and the finding on the physical property is still reported.
+#[test]
+fn modern_css_syntax_is_scanned_not_unscanned() {
+    let Some((_, v)) = check_fixture_doc("css-modern", "css") else { return };
+    assert_eq!(unscanned(&v, "css"), vec![], "{v}");
+}
+
+/// `using module` of a module that is not installed is a parse error
+/// `PSScriptAnalyzer` reports as a record, but a note, not an unscanned file:
+/// the rest of the file is analysed.
+#[test]
+fn powershell_using_a_missing_module_is_scanned() {
+    let Some((report, v)) = check_fixture_doc("powershell-using", "powershell") else { return };
+    assert!(report["message"].as_str().unwrap_or_default().contains("ModuleNotFoundDuringParse"), "{v}");
+    assert_eq!(unscanned(&v, "powershell"), vec![], "{v}");
+}
+
+/// `[SuppressMessage]` does not hide a finding: `PSScriptAnalyzer` runs with
+/// `-IncludeSuppressed`.
+#[test]
+fn powershell_suppress_message_does_not_hide_findings() {
+    check_fixture_doc("powershell-suppressed", "powershell");
+}
+
+/// A file ruff cannot read (Windows-1254 bytes, not UTF-8) is an unscanned
+/// file, never a clean one and never an E902 finding.
+#[test]
+fn python_file_that_is_not_utf8_is_unscanned() {
+    let r = python_repo("non-utf8", ">=3.12", "x = 1\n");
+    fs::write(r.0.join("latin.py"), b"# \xfe\xfd\nimport os\nx = os.path.join('a', 'b')\n").unwrap();
+    let (code, v) = scan(&r.0, &["--all-lines", "--stacks", "python", "--gate"]);
+    if stack_of(&v, "python")["status"] != "ok" {
+        eprintln!("python: {}", stack_of(&v, "python")["message"]);
+        return;
+    }
+    let list = unscanned(&v, "python");
+    assert_eq!(list.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), vec!["latin.py"], "{v}");
+    assert!(list[0].1.contains("valid UTF-8"), "{list:?}");
+    assert!(v["findings"].as_array().unwrap().iter().all(|f| f["rule"] != "E902"), "{v}");
+    assert_eq!(code, 2, "{v}");
+}
+
+/// Inline comments do not hide CSS findings: `stylelint-disable` (stylelint
+/// `ignoreDisables`) and `eslint-disable` (@eslint/css `noInlineConfig`).
+#[test]
+fn css_inline_disable_comments_do_not_hide_findings() {
+    let r = plain_repo(
+        "css-inline",
+        &[(
+            "a.css",
+            "/* stylelint-disable color-function-notation */\na { color: rgba(0, 0, 0, 0.5); }\n/* eslint-disable css/prefer-logical-properties */\nb { margin-left: 1px; }\n",
+        )],
+    );
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "css"]);
+    if stack_of(&v, "css")["status"] != "ok" {
+        return;
+    }
+    let found = findings_in(&v, "a.css");
+    assert!(found.contains(&("color-function-notation".to_string(), 2)), "stylelint-disable hid it: {v}");
+    assert!(found.contains(&("css/prefer-logical-properties".to_string(), 4)), "eslint-disable hid it: {v}");
+}
+
+/// A CSS file that does not parse is unscanned, never clean.
+#[test]
+fn css_that_does_not_parse_is_unscanned() {
+    let r = plain_repo("css-broken", &[("broken.css", "a {\n  color: red;\n")]);
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "css", "--gate"]);
+    if stack_of(&v, "css")["status"] != "ok" {
+        return;
+    }
+    let list = unscanned(&v, "css");
+    assert_eq!(list.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), vec!["broken.css"], "{v}");
+    assert!(list[0].1.contains("not parsed"), "{list:?}");
+}
+
+/// A file over 8 MiB is not copied: unscanned, in every stack that touched it.
+#[test]
+fn file_over_8_mib_is_unscanned() {
+    let r = python_repo("big-file", ">=3.12", "x = 1\n");
+    fs::write(r.0.join("big.py"), format!("x = '{}'\n", "a".repeat(9 << 20))).unwrap();
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "python", "--gate"]);
+    if stack_of(&v, "python")["status"] != "ok" {
+        return;
+    }
+    let list = unscanned(&v, "python");
+    assert_eq!(list.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), vec!["big.py"], "{v}");
+    assert!(list[0].1.contains("over 8 MiB"), "{list:?}");
+}
+
+/// A `.go` file with no go.mod above it is unscanned.
+#[test]
+fn go_file_without_go_mod_is_unscanned() {
+    let r = plain_repo("go-no-mod", &[("a.go", "package a\n")]);
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "go", "--gate"]);
+    if go_report(&v).is_none() {
+        return;
+    }
+    assert_eq!(unscanned(&v, "go"), vec![("a.go".to_string(), "no go.mod above it: not analysed".to_string())], "{v}");
+}
+
+/// A package go cannot load (`//go:embed` of an untracked folder) leaves its
+/// file unscanned with that reason; a package that fails to type-check under
+/// every GOOS leaves its file unscanned as "no GOOS pass compiled it".
+#[test]
+fn go_unloadable_and_uncompilable_packages_are_unscanned() {
+    let r = files_repo(
+        "go-unscanned",
+        &[("go.mod", "module example.com/u\n\ngo 1.21\n"), (".gitignore", "web/dist/\n")],
+        &[
+            ("web/web.go", "package web\n\nimport \"embed\"\n\n//go:embed dist\nvar FS embed.FS\n"),
+            ("bad/bad.go", "package bad\n\nvar X int = \"s\"\n"),
+            ("ok/ok.go", "package ok\n\nfunc F(v interface{}) {}\n"),
+        ],
+    );
+    let (_, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go", "--gate"]);
+    if go_report(&v).is_none() {
+        return;
+    }
+    let list = unscanned(&v, "go");
+    let reason = |f: &str| list.iter().find(|(file, _)| file == f).map(|(_, r)| r.clone());
+    assert!(reason("web/web.go").is_some_and(|r| r.contains("go cannot load its package")), "{v}");
+    assert_eq!(reason("bad/bad.go").as_deref(), Some("no GOOS pass compiled it"), "{v}");
+    assert_eq!(reason("ok/ok.go"), None, "{v}");
+}
+
+/// A `.cs` file with no `.csproj` above it is unscanned (dotnet format never ran).
+#[test]
+fn csharp_file_without_csproj_is_unscanned() {
+    let r = plain_repo("cs-no-proj", &[("a.cs", "class A { }\n")]);
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "csharp", "--gate"]);
+    if stack_of(&v, "csharp")["status"] == "skipped" {
+        return;
+    }
+    let list = unscanned(&v, "csharp");
+    assert_eq!(list.len(), 1, "{v}");
+    assert!(list[0].0 == "a.cs" && list[0].1.contains("no .csproj above it"), "{list:?}");
+}
+
+/// A file `PSScriptAnalyzer` fails on (the runner lists it under `failed`) is
+/// unscanned. The runner is replaced by a stub that fails every file.
+#[test]
+fn powershell_file_the_analyzer_failed_on_is_unscanned() {
+    if installed("pwsh").is_none() {
+        return;
+    }
+    let home = bare_home("pssa-failed", None);
+    fs::create_dir_all(home.0.join("ps")).unwrap();
+    let stub = "param($Job, $Out)\n$spec = Get-Content -LiteralPath $Job -Raw | ConvertFrom-Json\n$failed = @($spec.groups | ForEach-Object { $_.files })\n[ordered]@{ pssa = '1.0'; missing = $false; results = @(); errors = @('boom'); failed = $failed } | ConvertTo-Json -Depth 4 -Compress | Set-Content -LiteralPath $Out -Encoding utf8\n";
+    fs::write(home.0.join("ps").join("run-pssa.ps1"), stub).unwrap();
+    let r = plain_repo("pssa-failed", &[("a.ps1", "Write-Output 1\n")]);
+    let (_, v, _) = scan_home(&r.0, &home.0, &["--all-lines", "--stacks", "powershell", "--gate"]);
+    let report = stack_of(&v, "powershell");
+    if report["status"] == "skipped" {
+        return;
+    }
+    assert_eq!(unscanned(&v, "powershell"), vec![("a.ps1".to_string(), "PSScriptAnalyzer failed on it".to_string())], "{v}");
+}
+
+/// A file only another GOARCH includes (`*_arm64.go`, `linux && arm64`) is
+/// analysed by a pass for that CPU type, never left unscanned.
+#[test]
+fn go_files_for_another_goarch_are_analysed() {
+    let any = |pkg: &str| format!("package {pkg}\n\nfunc F(v interface{{}}) {{}}\n");
+    let r = files_repo(
+        "go-arch",
+        &[("go.mod", "module example.com/a\n\ngo 1.21\n"), ("a.go", "package a\n")],
+        &[("cpu/y_arm64.go", &any("cpu")), ("tagged/t.go", &format!("//go:build linux && arm64\n\n{}", any("tagged")))],
+    );
+    let (_, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go", "--gate"]);
+    let Some(report) = go_report(&v) else { return };
+    assert_eq!(report["status"], "ok", "{}", report["message"]);
+    assert_eq!(unscanned(&v, "go"), vec![], "{v}");
+    for file in ["cpu/y_arm64.go", "tagged/t.go"] {
+        assert!(v["findings"].as_array().unwrap().iter().any(|f| f["file"] == file && f["rule"] == "go/any"), "{file}: {v}");
+    }
+}
+
+/// Fallback files whose constraint only negates (`*_generic.go`, `*_other.go`)
+/// are compiled by a GOOS/GOARCH they do not name.
+#[test]
+fn go_files_behind_negated_constraints_are_analysed() {
+    let any = |pkg: &str| format!("package {pkg}\n\nfunc F(v interface{{}}) {{}}\n");
+    let r = files_repo(
+        "go-negated",
+        &[("go.mod", "module example.com/a\n\ngo 1.21\n"), ("a.go", "package a\n")],
+        &[
+            ("generic/g.go", &format!("//go:build !amd64 && !arm64\n\n{}", any("generic"))),
+            ("other/o.go", &format!("//go:build !windows && !linux && !darwin\n\n{}", any("other"))),
+        ],
+    );
+    let (_, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go", "--gate"]);
+    let Some(report) = go_report(&v) else { return };
+    assert_eq!(report["status"], "ok", "{}", report["message"]);
+    assert_eq!(unscanned(&v, "go"), vec![], "{v}");
+    for file in ["generic/g.go", "other/o.go"] {
+        assert!(v["findings"].as_array().unwrap().iter().any(|f| f["file"] == file && f["rule"] == "go/any"), "{file}: {v}");
+    }
+}
+
+/// A GOOS with no amd64 port (`wasip1`, `js`) is vetted with a GOARCH it has
+/// (wasm): two extra passes, both analysed, nothing unscanned.
+#[test]
+fn go_files_for_goos_without_amd64_are_analysed() {
+    let any = |pkg: &str| format!("package {pkg}\n\nfunc F(v interface{{}}) {{}}\n");
+    let r = files_repo(
+        "go-wasm",
+        &[("go.mod", "module example.com/w\n\ngo 1.21\n"), ("a.go", "package w\n")],
+        &[("web/z_wasip1.go", &any("web")), ("x_js.go", &any("w"))],
+    );
+    let (_, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go", "--gate"]);
+    let Some(report) = go_report(&v) else { return };
+    assert_eq!(report["status"], "ok", "{}", report["message"]);
+    assert_eq!(unscanned(&v, "go"), vec![], "{v}");
+    for file in ["web/z_wasip1.go", "x_js.go"] {
+        assert!(v["findings"].as_array().unwrap().iter().any(|f| f["file"] == file && f["rule"] == "go/any"), "{file}: {v}");
+    }
+}
+
+/// Files beyond the three-pass cap stay candidates until every pass has run:
+/// one a later pass compiles is analysed, not listed unscanned; only a file
+/// still uncovered carries the cap reason.
+#[test]
+fn go_over_cap_files_that_a_later_pass_compiles_are_not_unscanned() {
+    let file = |tag: &str, name: &str| (format!("{name}.go"), format!("//go:build {tag}\n\npackage t\n\nfunc F{name}(v interface{{}}) {{}}\n"));
+    let files = [file("z", "z1"), file("z", "z2"), file("ta", "ta"), file("tb", "tb"), file("tc", "tc"), file("ua || z", "f")];
+    let change: Vec<(&str, &str)> = files.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let r = files_repo("go-cap-late", &[("go.mod", "module example.com/c\n\ngo 1.21\n"), ("a.go", "package t\n")], &change);
+    let (_, v) = scan(&r.0, &["--range", "HEAD~1..HEAD", "--stacks", "go", "--gate"]);
+    let Some(report) = go_report(&v) else { return };
+    assert_eq!(report["status"], "ok", "{}", report["message"]);
+    let list = unscanned(&v, "go");
+    assert_eq!(list.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), vec!["tc.go"], "{v}");
+    assert!(list[0].1.contains("more than 3 extra"), "{list:?}");
+    assert!(v["findings"].as_array().unwrap().iter().any(|f| f["file"] == "f.go" && f["rule"] == "go/any"), "f.go is compiled by the z pass: {v}");
 }

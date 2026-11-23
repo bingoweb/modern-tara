@@ -15,7 +15,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Passed with `-W` besides `clippy::pedantic`.
+/// Passed with `--force-warn` (like `MODERN_EXTRA`, `RAISED_ONLY` and
+/// `FORCE_GROUPS`), so an `#[allow]` in the code never hides them.
 pub const WARN: [&str; 15] = [
     "manual_let_else",
     "uninlined_format_args",
@@ -82,6 +83,16 @@ pub const MODERN_EXTRA: [&str; 38] = [
 /// Rust 1.88+ (let chains). Recorded in both runs, reported only as needs-newer.
 pub const RAISED_ONLY: [&str; 1] = ["collapsible_if"];
 
+/// Lint groups forced to warn as a whole: they hold the `manual_*` lints
+/// (counted modern by name) and `incompatible_msrv`. Their other lints are
+/// dropped by `is_modern_lint`.
+pub const FORCE_GROUPS: [&str; 5] = ["pedantic", "style", "complexity", "perf", "suspicious"];
+
+/// The clippy lints the stack reports, as the `rules` of the JSON report.
+pub fn rule_ids() -> Vec<String> {
+    WARN.iter().chain(&MODERN_EXTRA).chain(&RAISED_ONLY).chain(&["manual_*", "incompatible_msrv"]).map(|l| format!("clippy::{l}")).collect()
+}
+
 fn raised_only(name: &str) -> bool {
     RAISED_ONLY.contains(&name.trim_start_matches("clippy::"))
 }
@@ -138,9 +149,13 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
     );
     report.newest("rust", newest.clone());
 
+    report.ran(rule_ids());
     let (workspaces, loose) = locate(ctx.change, files);
     if !loose.is_empty() {
         report.note(format!("no Cargo.toml above {} file(s); only catalogue rules ran there.", loose.len()));
+    }
+    for f in &loose {
+        report.unscanned(f.clone(), "no Cargo.toml above it: clippy did not run (catalogue rules only)");
     }
     let mut pin_json = serde_json::Map::new();
     for ws in &workspaces {
@@ -161,6 +176,7 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
         let _ = ctx.change.materialize(&copy, files);
         match astgrep::scan(ctx, &copy, files) {
             Ok(Some(matches)) => {
+                report.ran(astgrep::rule_ids(&ctx.home, "rust-version"));
                 for m in matches.into_iter().filter(|m| m.gate == "rust-version") {
                     let rv = workspaces.iter().find(|w| w.files.contains(&m.file)).and_then(|w| w.rust_version.clone());
                     let below = matches!((rv.as_deref().and_then(pins::rust_version), pins::rust_version(&m.min)), (Some(have), Some(need)) if have < need);
@@ -169,12 +185,13 @@ pub fn run(ctx: &Ctx, files: &[String]) -> StackReport {
                 }
             }
             Ok(None) => report.note("ast-grep not found: catalogue rules skipped."),
-            Err(e) => report.note(e),
+            Err(e) => report.fail(e),
         }
     }
     report
 }
 
+#[expect(clippy::too_many_lines, reason = "one linear pipeline: copy, base run, raised run")]
 fn run_workspace(ctx: &Ctx, report: &mut StackReport, cargo: &Path, ws: &Workspace, index: usize, strip_cc: bool, newest: &str) {
     let label = if ws.root.is_empty() { "." } else { ws.root.as_str() };
     let sources = copy_set(ctx.change, &ws.root);
@@ -193,11 +210,20 @@ fn run_workspace(ctx: &Ctx, report: &mut StackReport, cargo: &Path, ws: &Workspa
     let names = package_names(&base_copy, &sources);
     let cwd = change::safe_join(&base_copy, &ws.root).unwrap_or_else(|| base_copy.clone());
     let base = clippy_run(ctx, cargo, &cwd, &target_dir, strip_cc);
+    let unscanned = |report: &mut StackReport, why: &str| {
+        for f in &ws.files {
+            report.unscanned(f.clone(), format!("clippy did not finish in {label}: {why}"));
+        }
+    };
     let base = match base {
         Ok(b) => b,
-        Err(e) => return report.fail(format!("{label}: {e}")),
+        Err(e) => {
+            unscanned(report, &e);
+            return report.fail(format!("{label}: {e}"));
+        }
     };
     if let Some(err) = &base.error {
+        unscanned(report, err);
         report.fail(format!("{label}: clippy did not finish: {err}"));
     }
     let mut seen: HashSet<(String, u32, String)> = HashSet::new();
@@ -327,7 +353,7 @@ struct ClippyRun {
 
 fn clippy_run(ctx: &Ctx, cargo: &Path, cwd: &Path, target_dir: &Path, strip_cc: bool) -> Result<ClippyRun, String> {
     let mut cmd = Cmd::new(cargo)
-        .args(["clippy", "--message-format=json", "--all-targets", "--keep-going", "--color", "never", "--", "-W", "clippy::pedantic"])
+        .args(["clippy", "--message-format=json", "--workspace", "--all-targets", "--keep-going", "--color", "never", "--"])
         .cwd(cwd)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
@@ -336,8 +362,9 @@ fn clippy_run(ctx: &Ctx, cargo: &Path, cwd: &Path, target_dir: &Path, strip_cc: 
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .timeout(ctx.timeout_or(900));
-    for lint in WARN {
-        cmd = cmd.arg("-W").arg(format!("clippy::{lint}"));
+    // `--force-warn` (stable): no `#[allow]`/`#[expect]` or `deny` in the code changes these.
+    for lint in FORCE_GROUPS.iter().chain(&WARN).chain(&MODERN_EXTRA).chain(&RAISED_ONLY).chain(&["incompatible_msrv"]) {
+        cmd = cmd.arg("--force-warn").arg(format!("clippy::{lint}"));
     }
     if strip_cc {
         // A user-wide CC (MinGW gcc) breaks MSVC links of crates with C code.

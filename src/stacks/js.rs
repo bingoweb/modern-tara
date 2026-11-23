@@ -228,6 +228,16 @@ fn run_driver(ctx: &Ctx, node: &Path, job: &Value, name: &str, default_timeout: 
     serde_json::from_slice(&out.stdout).map_err(|e| format!("{name} driver output: {e}: {}", out.tail(2)))
 }
 
+/// The driver's `unscanned` files and the `rules` its config turned on.
+fn driver_lists(report: &mut StackReport, out: &Value) {
+    for u in out.get("unscanned").and_then(Value::as_array).into_iter().flatten() {
+        if let (Some(file), Some(why)) = (u.get("file").and_then(Value::as_str).and_then(change::normalize), u.get("reason").and_then(Value::as_str)) {
+            report.unscanned(file, why);
+        }
+    }
+    report.ran(out.get("rules").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str));
+}
+
 #[expect(clippy::too_many_lines, reason = "one linear pipeline: pins, copy, run, parse")]
 pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
     let mut report = StackReport::new("js", files.to_vec());
@@ -327,6 +337,7 @@ pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
         }
     };
     report.tool = out.get("tool").and_then(Value::as_str).unwrap_or("eslint").to_string();
+    driver_lists(&mut report, &out);
     for n in out.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
         report.note(n);
     }
@@ -392,6 +403,7 @@ pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
 
     match astgrep::scan(ctx, &dir, files) {
         Ok(Some(matches)) => {
+            report.ran(astgrep::rule_ids(&ctx.home, "engines.node"));
             for m in matches.into_iter().filter(|m| m.gate == "engines.node") {
                 let info = infos.iter().find(|(f, ..)| *f == m.file).map(|(_, i, _)| i);
                 let engines = info.and_then(|i| i.engines.clone());
@@ -407,7 +419,7 @@ pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
             }
         }
         Ok(None) => report.note("ast-grep not found: catalogue rules skipped."),
-        Err(e) => report.note(e),
+        Err(e) => report.fail(e),
     }
     report
 }
@@ -459,7 +471,7 @@ pub fn run_css(ctx: &Ctx, files: &[String]) -> StackReport {
         report.fail(e);
         return report;
     }
-    let job = json!({"mode": "stylelint", "root": dir.to_string_lossy(), "files": entries});
+    let job = json!({"mode": "stylelint", "root": dir.to_string_lossy(), "files": entries, "logicalProperties": LOGICAL_PROPERTIES});
     let out = match run_driver(ctx, &node, &job, "stylelint", 120) {
         Ok(v) => v,
         Err(e) => {
@@ -468,6 +480,7 @@ pub fn run_css(ctx: &Ctx, files: &[String]) -> StackReport {
         }
     };
     report.tool = out.get("tool").and_then(Value::as_str).unwrap_or("stylelint").to_string();
+    driver_lists(&mut report, &out);
     for n in out.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
         report.note(n);
     }
@@ -481,6 +494,10 @@ pub fn run_css(ctx: &Ctx, files: &[String]) -> StackReport {
             "plugin/use-baseline" => (Kind::Baseline, Confidence::High),
             LONGHAND_RULE if !names_newer_shorthand(&message) => continue,
             LONGHAND_RULE => (Kind::Modern, Confidence::Low),
+            LOGICAL_RULE => match logical_confidence(&message) {
+                Some(c) => (Kind::Modern, c),
+                None => continue,
+            },
             _ => (Kind::Modern, Confidence::High),
         };
         report.findings.push(Finding {
@@ -497,6 +514,46 @@ pub fn run_css(ctx: &Ctx, files: &[String]) -> StackReport {
         });
     }
     report
+}
+
+/// @eslint/css's logical-properties rule. Its options (from the driver)
+/// keep only `LOGICAL_PROPERTIES` and no units; see [`logical_confidence`].
+const LOGICAL_RULE: &str = "css/prefer-logical-properties";
+
+/// The physical properties of the horizontal direction the CSS catalogue
+/// names; every other property (`width`, `top`, ...) and every unit (`vh`)
+/// is left out. All but `left`/`right` are high confidence: a positioned
+/// box's inset is often physical on purpose, so those two only warn.
+pub const LOGICAL_PROPERTIES: [&str; 14] = [
+    "margin-left",
+    "margin-right",
+    "padding-left",
+    "padding-right",
+    "border-left",
+    "border-left-color",
+    "border-left-style",
+    "border-left-width",
+    "border-right",
+    "border-right-color",
+    "border-right-style",
+    "border-right-width",
+    "left",
+    "right",
+];
+
+/// Confidence of a logical-properties message, `None` to drop it: a
+/// `LOGICAL_PROPERTIES` property is high (`left`/`right` low); a value is high for `text-align:
+/// left|right` (logical `start`/`end`), else low (`float`, `clear`,
+/// `resize`, ...); any other property or a unit is dropped.
+fn logical_confidence(message: &str) -> Option<Confidence> {
+    let quoted: Vec<&str> = message.split('\'').skip(1).step_by(2).collect();
+    if message.starts_with("Expected logical property") {
+        quoted.get(1).filter(|p| LOGICAL_PROPERTIES.contains(p)).map(|&p| if matches!(p, "left" | "right") { Confidence::Low } else { Confidence::High })
+    } else if message.starts_with("Expected logical value") {
+        Some(if matches!(quoted.first(), Some(&("start" | "end"))) { Confidence::High } else { Confidence::Low })
+    } else {
+        None
+    }
 }
 
 /// stylelint's redundant-longhand rule. Its findings are kept only for
@@ -560,6 +617,21 @@ mod tests {
         }
         assert!(stylelint.contains(&format!("'{LONGHAND_RULE}'")));
         assert!(stylelint.contains("'color-function-notation'") && stylelint.contains("'media-feature-range-notation'"));
+    }
+
+    #[test]
+    fn logical_properties_are_high_only_when_unambiguous() {
+        let c = |m: &str| logical_confidence(m);
+        assert_eq!(c("Expected logical property 'margin-inline-start' instead of 'margin-left'."), Some(Confidence::High));
+        // A positioned box's `left`/`right` is often physical on purpose: a warning, never a gate stop.
+        assert_eq!(c("Expected logical property 'inset-inline-end' instead of 'right'."), Some(Confidence::Low));
+        assert_eq!(c("Expected logical property 'inset-inline-start' instead of 'left'."), Some(Confidence::Low));
+        assert_eq!(c("Expected logical property 'border-inline-start-width' instead of 'border-left-width'."), Some(Confidence::High));
+        assert_eq!(c("Expected logical property 'inline-size' instead of 'width'."), None);
+        assert_eq!(c("Expected logical property 'inset-block-start' instead of 'top'."), None);
+        assert_eq!(c("Expected logical unit 'vb' instead of 'vh'."), None);
+        assert_eq!(c("Expected logical value 'end' instead of 'right'."), Some(Confidence::High));
+        assert_eq!(c("Expected logical value 'inline-start' instead of 'left'."), Some(Confidence::Low));
     }
 
     #[test]

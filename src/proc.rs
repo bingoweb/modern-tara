@@ -17,6 +17,37 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// inherited the pipe (an `MSBuild` node, a compiler server) may never close it.
 const DRAIN_GRACE: Duration = Duration::from_secs(3);
 
+/// Longest command line a chunked call builds, in UTF-16 units: Windows'
+/// `CreateProcess` takes 32767, the rest is margin.
+pub const MAX_LINE: usize = 24_000;
+
+/// One argument's share of a Windows command line: its UTF-16 units, a
+/// space, two quotes and an escape for every `"` and `\`.
+pub fn arg_len(arg: &OsStr) -> usize {
+    let text = arg.to_string_lossy();
+    text.encode_utf16().count() + text.chars().filter(|c| matches!(c, '"' | '\\')).count() + 3
+}
+
+/// `items` split so that `fixed` (the rest of the line) plus each chunk
+/// stays under [`MAX_LINE`]. An item too long on its own gets a chunk alone.
+pub fn chunks<S: AsRef<OsStr>>(fixed: usize, items: &[S]) -> Vec<&[S]> {
+    let mut out = Vec::new();
+    let (mut start, mut len) = (0, fixed);
+    for (i, item) in items.iter().enumerate() {
+        let n = arg_len(item.as_ref());
+        if i > start && len + n > MAX_LINE {
+            out.push(&items[start..i]);
+            (start, len) = (i, fixed);
+        }
+        len += n;
+    }
+    if start < items.len() {
+        out.push(&items[start..]);
+    }
+    out
+}
+
+#[derive(Clone)]
 pub struct Cmd {
     program: PathBuf,
     args: Vec<OsString>,
@@ -101,9 +132,16 @@ impl Cmd {
         self.timeout = t;
         self
     }
-    /// Total length of the command line, to stay under the Windows limit.
+    /// Length of the command line in UTF-16 units, quoting included, to stay
+    /// under the Windows limit.
     pub fn line_len(&self) -> usize {
-        self.program.as_os_str().len() + self.args.iter().map(|a| a.len() + 3).sum::<usize>()
+        arg_len(self.program.as_os_str()) + self.args.iter().map(|a| arg_len(a)).sum::<usize>()
+    }
+
+    /// Runs the command once per chunk of `items` (appended after the other
+    /// arguments), each chunk keeping the line under [`MAX_LINE`].
+    pub fn run_chunked<S: AsRef<OsStr>>(&self, items: &[S]) -> Result<Vec<Output>, String> {
+        chunks(self.line_len(), items).into_iter().map(|chunk| self.clone().args(chunk).run()).collect()
     }
 
     pub fn run(self) -> Result<Output, String> {
@@ -285,6 +323,33 @@ mod tests {
         }
         assert!(!alive(), "grandchild {pid} survived the timeout");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunks_stay_under_the_line_limit_and_keep_every_item() {
+        // 600 paths of ~150 units (one with `ş`, one with quotes): ~94000 units in all.
+        let items: Vec<String> = (0..600).map(|i| format!("deep/{}/ş\"q\\{i:04}.py", "x".repeat(140))).collect();
+        let fixed = Cmd::new("C:/tools/ruff.exe").args(["check", "--output-format", "json"]).line_len();
+        let parts = chunks(fixed, &items);
+        assert!(parts.len() >= 4, "{}", parts.len());
+        for p in &parts {
+            assert_ne!(p.len(), 0);
+            assert!(fixed + p.iter().map(|s| arg_len(s.as_ref())).sum::<usize>() <= MAX_LINE);
+        }
+        assert_eq!(parts.concat(), items, "every item once, in order");
+        assert_eq!(chunks(fixed, &[] as &[String]).len(), 0);
+        let huge = vec!["y".repeat(MAX_LINE + 10), "z".into()];
+        assert_eq!(chunks(fixed, &huge).len(), 2, "an oversized item stands alone");
+        assert_eq!(arg_len(OsStr::new("aş\"")), 3 + 1 + 3);
+    }
+
+    #[test]
+    fn run_chunked_runs_a_long_list() {
+        // This test binary lists tests by any number of filters: ~60000 units
+        // on one line would fail on Windows (os error 206).
+        let items: Vec<String> = (0..400).map(|i| format!("{}{i}", "p".repeat(150))).collect();
+        let outs = Cmd::new(std::env::current_exe().unwrap()).args(["--list", "--format", "terse"]).run_chunked(&items).unwrap();
+        assert!(outs.len() > 1 && outs.iter().all(Output::ok), "{}", outs.len());
     }
 
     #[test]

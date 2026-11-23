@@ -21,7 +21,7 @@ mod waiver;
 
 use change::{Change, Lines, Source};
 use git::Git;
-use report::{Finding, StackReport, Status};
+use report::{Finding, StackReport};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -120,6 +120,17 @@ fn scan(o: &cli::Opts) -> Result<i32, String> {
             .collect()
     });
 
+    // Touched files no stack can copy (unreadable or too large) are unscanned everywhere.
+    let touched: Vec<String> = work.iter().flat_map(|(_, files)| files.iter().cloned()).collect();
+    let unreadable = change.unreadable(&touched)?;
+    for r in &mut reports {
+        r.allowed = o.allow_skipped.iter().any(|s| s == r.stack);
+        for f in r.files.iter().filter(|f| unreadable.contains(f)).cloned().collect::<Vec<_>>() {
+            r.unscanned(f, format!("unreadable or over {} MiB: not copied", change::MAX_FILE_BYTES >> 20));
+        }
+    }
+    let no_stack = no_stack(&change);
+
     let mut findings: Vec<Finding> = Vec::new();
     for r in &mut reports {
         for f in r.findings.drain(..) {
@@ -137,7 +148,7 @@ fn scan(o: &cli::Opts) -> Result<i32, String> {
     warnings.extend(waivers.warnings(today, o.all_lines));
 
     let repo = change.root.to_string_lossy().replace('\\', "/");
-    let extras = report::Extras { waived: &waived, waivers: &waivers.to_json(today), warnings: &warnings };
+    let extras = report::Extras { waived: &waived, waivers: &waivers.to_json(today), warnings: &warnings, no_stack: &no_stack };
     let doc = report::document(VERSION, &repo, &change.describe, &reports, &findings, &extras);
     let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     if let Some(path) = &o.json_out {
@@ -148,12 +159,35 @@ fn scan(o: &cli::Opts) -> Result<i32, String> {
         let _ = out.flush();
     }
     let total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let failed = reports.iter().any(|r| r.status == Status::Error);
-    let code = report::exit_code(&findings, failed, o.gate);
+    let code = report::exit_code(&findings, &reports, o.gate);
     if !o.quiet {
-        eprint!("{}", report::summary(&reports, &findings, waived.len(), &warnings, total_ms, o.gate.then_some(code)));
+        eprint!("{}", report::summary(&reports, &findings, waived.len(), &warnings, total_ms, o.gate.then_some(code), &no_stack));
     }
     Ok(code)
+}
+
+/// Changed files whose extension no stack takes, per extension.
+fn no_stack(change: &Change) -> report::NoStack {
+    let mut by = report::NoStack::new();
+    for f in change.files.keys() {
+        let ext = change::extension(f);
+        if !stacks::ALL.iter().any(|s| stacks::extensions(s).contains(&ext.as_str())) {
+            *by.entry(if ext.is_empty() { "(none)".into() } else { ext }).or_default() += 1;
+        }
+    }
+    by
+}
+
+/// Folders `--all-lines` alone leaves out of a plain folder (besides
+/// `change::SKIP_DIRS`); `bin` right under `src` is a Rust source folder.
+const ALL_LINES_SKIP: [&str; 9] = [".git", "node_modules", "target", "bin", "obj", ".venv", "__pycache__", "dist", "build"];
+
+fn all_lines_skipped(path: &str) -> bool {
+    let dirs: Vec<&str> = path.split('/').collect();
+    let dirs = &dirs[..dirs.len().saturating_sub(1)];
+    dirs.iter()
+        .enumerate()
+        .any(|(i, d)| ALL_LINES_SKIP.iter().any(|s| d.eq_ignore_ascii_case(s)) && !(d.eq_ignore_ascii_case("bin") && i > 0 && dirs[i - 1] == "src"))
 }
 
 fn run_stack(ctx: &stacks::Ctx, stack: &'static str, files: &[String]) -> StackReport {
@@ -187,7 +221,11 @@ fn build_change(o: &cli::Opts, dir: &Path) -> Result<Change, String> {
             return Err("--range and --staged need a git repository".into());
         }
         let mut change = Change::new(dir.to_path_buf(), Source::Dir, BTreeMap::new(), json!({}));
-        let (files, unmatched) = select(&change, &o.files, "", dir)?;
+        let (files, unmatched) = if o.files.is_empty() {
+            (change.listing()?.iter().filter(|p| !all_lines_skipped(p)).cloned().collect(), Vec::new())
+        } else {
+            select(&change, &o.files, "", dir)?
+        };
         let count = files.len();
         change.files = files.into_iter().map(|f| (f, Lines::All)).collect();
         change.describe = with_unmatched(json!({"mode": "files", "git": false, "all_lines": true, "files": count}), &unmatched);
@@ -199,8 +237,11 @@ fn build_change(o: &cli::Opts, dir: &Path) -> Result<Change, String> {
     let prefix = change::strip_dir(&dir.to_string_lossy(), &top.to_string_lossy()).unwrap_or_default();
 
     let (source, base, target, mode) = if let Some((a, b)) = &o.range {
-        let from = g.resolve(a)?;
         let to = g.resolve(b)?;
+        let from = g.resolve(a)?;
+        // Both names resolved above (neither starts with `-`); merge-base gets
+        // them as typed so its error message names them.
+        let from = if o.merge_base { g.merge_base(a, b)? } else { from };
         (Source::Rev(g.clone(), to.clone()), from, Some(to), "range")
     } else if o.staged {
         let from = if g.has_head() { "HEAD".to_string() } else { git::EMPTY_TREE.to_string() };
@@ -219,11 +260,9 @@ fn build_change(o: &cli::Opts, dir: &Path) -> Result<Change, String> {
     let files: BTreeMap<String, Lines> = if o.all_lines {
         let list = match &wanted {
             Some(w) => w.clone(),
-            None => match &change.source {
-                Source::WorkTree(g) => g.ls_index()?.into_iter().filter(|p| !change::in_skip_dir(p)).collect(),
-                // Tracked files are sources even under bin/ or target/.
-                _ => change.listing()?.to_vec(),
-            },
+            // Tracked files are sources even under bin/ or target/; the work
+            // tree adds untracked files that are not ignored (nor build output).
+            None => change.listing()?.to_vec(),
         };
         list.into_iter().map(|f| (f, Lines::All)).collect()
     } else {
@@ -253,6 +292,7 @@ fn build_change(o: &cli::Opts, dir: &Path) -> Result<Change, String> {
             "files": files.len(),
             "changed_lines": if o.all_lines { None } else { Some(changed_lines) },
             "git_safe": o.git_safe,
+            "merge_base": o.merge_base,
         }),
         &unmatched,
     );
