@@ -7,13 +7,13 @@ use crate::pins::{self, NEWEST_ECMASCRIPT, NEWEST_NODE};
 use crate::proc::Cmd;
 use crate::report::{Confidence, Finding, Kind, StackReport, Upgrade};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
 /// Rule, first Node release with what it suggests, whether TypeScript can
 /// compile the construct down (syntax), and the construct.
-pub const RULES: [(&str, (u32, u32), bool, &str); 36] = [
+pub const RULES: [(&str, (u32, u32), bool, &str); 42] = [
     ("unicorn/prefer-at", (16, 6), false, "Array/String .at(), ES2022"),
     ("unicorn/prefer-structured-clone", (17, 0), false, "structuredClone()"),
     ("unicorn/prefer-node-protocol", (16, 0), false, "`node:` specifiers"),
@@ -42,6 +42,12 @@ pub const RULES: [(&str, (u32, u32), bool, &str); 36] = [
     ("unicorn/prefer-group-by", (21, 0), false, "Object.groupBy()/Map.groupBy(), ES2024"),
     ("unicorn/prefer-array-from-async", (22, 0), false, "Array.fromAsync(), ES2026"),
     ("unicorn/prefer-regexp-escape", (24, 0), false, "RegExp.escape(), ES2025"),
+    ("unicorn/no-for-loop", (0, 12), false, "for-of instead of an index loop, ES2015"),
+    ("unicorn/no-useless-spread", (0, 10), false, "no spread where the value is already a copy"),
+    ("unicorn/prefer-negative-index", (0, 10), false, "negative index instead of length minus index"),
+    ("unicorn/prefer-string-slice", (0, 10), false, "String#slice() instead of substr()/substring()"),
+    ("unicorn/no-array-sort", (20, 0), false, "Array#toSorted(), ES2023"),
+    ("unicorn/no-array-reverse", (20, 0), false, "Array#toReversed(), ES2023"),
     ("@typescript-eslint/prefer-optional-chain", (14, 0), true, "optional chaining, ES2020"),
     ("@typescript-eslint/prefer-nullish-coalescing", (14, 0), true, "nullish coalescing, ES2020"),
     ("@typescript-eslint/prefer-includes", (6, 0), false, "includes(), ES2016"),
@@ -51,6 +57,45 @@ pub const RULES: [(&str, (u32, u32), bool, &str); 36] = [
     ("no-var", (6, 0), true, "let/const, ES2015"),
     ("prefer-template", (4, 0), true, "template literals, ES2015"),
 ];
+/// Shortening rules that are `high` only when the `ESLint` message carries a fix.
+const FIX_GATED: [&str; 3] = ["unicorn/no-useless-spread", "unicorn/prefer-negative-index", "unicorn/prefer-string-slice"];
+/// Always `low`: `no-for-loop`'s for-of fix changes behaviour on strings
+/// (UTF-16 units against code points) and unicorn cannot tell strings from arrays.
+const NO_FOR_LOOP: &str = "unicorn/no-for-loop";
+/// ES2023 copy methods: no autofix (the mutation may be intended), so always
+/// `low`; a TypeScript file whose tsconfig `target` is below ES2023 cannot use them.
+const ES2023_COPY_RULES: [&str; 2] = ["unicorn/no-array-sort", "unicorn/no-array-reverse"];
+
+/// `low` for `no-for-loop`, the ES2023 copy rules, a `substring()` finding
+/// of `prefer-string-slice` (its fix `s.slice(Math.max(0, start))` is longer and
+/// `substring` is not deprecated) and a `FIX_GATED` rule without an autofix,
+/// else `high`.
+fn confidence_for(rule: &str, fixable: bool, message: &str) -> Confidence {
+    let substring = rule == "unicorn/prefer-string-slice" && message.contains("`String#substring()`");
+    if rule == NO_FOR_LOOP || ES2023_COPY_RULES.contains(&rule) || substring || FIX_GATED.contains(&rule) && !fixable {
+        Confidence::Low
+    } else {
+        Confidence::High
+    }
+}
+
+/// The ES year of a tsconfig `target` (`ES5` 5, `ES6` 2015, `ES2022` 2022); `ESNext` is the newest.
+fn es_year(target: &str) -> Option<u32> {
+    let t = target.to_ascii_lowercase();
+    match t.as_str() {
+        "esnext" | "latest" => Some(u32::MAX),
+        "es6" => Some(2015),
+        _ => t.strip_prefix("es")?.parse().ok(),
+    }
+}
+
+/// The `compilerOptions.target` of a tsconfig, as written and as a year.
+fn tsconfig_target(change: &Change, tsconfig: &str) -> Option<(String, u32)> {
+    let v: Value = serde_json::from_str(&pins::strip_json_comments(&change.read_text(tsconfig)?)).ok()?;
+    let target = v.pointer("/compilerOptions/target")?.as_str()?;
+    Some((target.to_string(), es_year(target)?))
+}
+
 /// Also on, ES2015 like `prefer-template`.
 const OBJECT_SHORTHAND: (&str, (u32, u32), bool, &str) = ("object-shorthand", (4, 0), true, "shorthand properties, ES2015");
 
@@ -124,7 +169,9 @@ pub const ES_X: [(&str, (u32, u32)); 54] = [
 
 /// The same feature in both tables: (es-x rule, `RULES` rule).
 #[cfg(test)]
-pub const SAME_FEATURE: [(&str, &str); 12] = [
+pub const SAME_FEATURE: [(&str, &str); 14] = [
+    ("es-x/no-array-prototype-tosorted", "unicorn/no-array-sort"),
+    ("es-x/no-array-prototype-toreversed", "unicorn/no-array-reverse"),
     ("es-x/no-array-prototype-at", "unicorn/prefer-at"),
     ("es-x/no-object-hasown", "prefer-object-has-own"),
     ("es-x/no-top-level-await", "unicorn/prefer-top-level-await"),
@@ -260,6 +307,7 @@ pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
     let mut kept_kind = 0usize;
     let mut ts_dirs: BTreeSet<String> = BTreeSet::new();
     let mut infos = Vec::new();
+    let mut ts_targets: BTreeMap<String, (String, u32)> = BTreeMap::new();
     for f in files {
         let ext = change::extension(f);
         let info = package_for(change, f);
@@ -270,6 +318,9 @@ pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
         }
         if let Some(t) = &tsconfig {
             ts_dirs.insert(change::parent(t).to_string());
+            if let Some(target) = tsconfig_target(change, t) {
+                ts_targets.insert(f.clone(), target);
+            }
         }
         let classic = ctx.classic_scripts.iter().any(|g| g.matches(f));
         if classic && !is_classic_ext(&ext) {
@@ -380,22 +431,35 @@ pub fn run_js(ctx: &Ctx, files: &[String]) -> StackReport {
         let Some(&&(_, min, syntax, construct)) = table.iter().find(|(id, ..)| *id == rule) else { continue };
         let floor = info.engines.as_deref().and_then(pins::node_min);
         let below = floor.is_some_and(|(a, b, _)| (a, b) < min) && !(*is_ts && syntax);
+        let old_target = ES2023_COPY_RULES.contains(&rule.as_str()).then(|| ts_targets.get(&file)).flatten().filter(|(_, year)| *year < 2023);
+        let upgrade = if below {
+            Some(Upgrade {
+                pin: "engines.node".into(),
+                from: info.engines.clone().unwrap_or_default(),
+                to: NEWEST_NODE.into(),
+                note: format!("{construct} needs Node {}.{}+", min.0, min.1),
+            })
+        } else {
+            old_target.map(|(name, _)| Upgrade {
+                pin: "tsconfig target".into(),
+                from: name.clone(),
+                to: "ES2023".into(),
+                note: format!("{construct} needs a tsconfig target of ES2023 or newer"),
+            })
+        };
+        let fixable = r.get("fixable").and_then(Value::as_bool).unwrap_or(false);
+        let message = r.get("message").and_then(Value::as_str).unwrap_or("").to_string();
         report.findings.push(Finding {
             stack: "js",
             file,
             line: num("line"),
             column: num("column"),
+            confidence: confidence_for(&rule, fixable, &message),
             rule,
-            message: r.get("message").and_then(Value::as_str).unwrap_or("").to_string(),
-            kind: if below { Kind::NeedsNewer } else { Kind::Modern },
+            message,
+            kind: if upgrade.is_some() { Kind::NeedsNewer } else { Kind::Modern },
             source: "tool",
-            confidence: crate::report::Confidence::High,
-            upgrade: below.then(|| Upgrade {
-                pin: "engines.node".into(),
-                from: info.engines.clone().unwrap_or_default(),
-                to: NEWEST_NODE.into(),
-                note: format!("{construct} needs Node {}.{}+", min.0, min.1),
-            }),
+            upgrade,
         });
     }
 
@@ -594,6 +658,33 @@ mod tests {
         assert!(esx_rules_for((18, 0, 0)).contains(&"es-x/no-regexp-v-flag"));
         assert!(!esx_rules_for((18, 0, 0)).contains(&"es-x/no-array-prototype-findlast-findlastindex"));
         assert_eq!(esx_rules_for((26, 0, 0)), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn shortening_rules_are_high_only_with_an_autofix() {
+        let c = |rule: &str, fixable, message: &str| confidence_for(rule, fixable, message);
+        assert_eq!(c("unicorn/no-for-loop", true, ""), Confidence::Low);
+        assert_eq!(c("unicorn/no-useless-spread", true, ""), Confidence::High);
+        assert_eq!(c("unicorn/no-useless-spread", false, ""), Confidence::Low);
+        assert_eq!(c("unicorn/no-array-sort", true, ""), Confidence::Low);
+        assert_eq!(c("unicorn/no-array-reverse", false, ""), Confidence::Low);
+        assert_eq!(c("unicorn/prefer-at", false, ""), Confidence::High);
+        let (substr, substring) = ("Prefer `String#slice()` over `String#substr()`.", "Prefer `String#slice()` over `String#substring()`.");
+        assert_eq!(c("unicorn/prefer-string-slice", true, substr), Confidence::High);
+        assert_eq!(c("unicorn/prefer-string-slice", false, substr), Confidence::Low);
+        assert_eq!(c("unicorn/prefer-string-slice", true, substring), Confidence::Low);
+        let eslint = include_str!("../../js/modern-tara.eslint.mjs");
+        for rule in FIX_GATED.iter().chain(&ES2023_COPY_RULES).chain(&[NO_FOR_LOOP]) {
+            let name = rule.trim_start_matches("unicorn/");
+            assert!(eslint.contains(&format!("'{name}'")), "{name}");
+            assert!(RULES.iter().any(|(id, ..)| id == rule), "{rule}");
+        }
+    }
+
+    #[test]
+    fn tsconfig_targets_are_read_as_years() {
+        let years = [es_year("ES5"), es_year("es6"), es_year("ES2022"), es_year("ES2023"), es_year("ESNext"), es_year("nope")];
+        assert_eq!(years, [Some(5), Some(2015), Some(2022), Some(2023), Some(u32::MAX), None]);
     }
 
     #[test]

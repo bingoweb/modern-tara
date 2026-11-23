@@ -1,4 +1,5 @@
-//! Python: ruff's stable UP, FURB, PTH and SIM rules at the project's
+//! Python: ruff's stable UP, FURB, PTH and SIM rules, and the families that
+//! turn long code into a shorter construct (`SHORTENING`), at the project's
 //! `requires-python`, then at 3.15; findings only the newer targets show are
 //! `needs-newer`, with the first version that enables them.
 
@@ -6,13 +7,17 @@ use super::{Ctx, astgrep};
 use crate::change::{self, Change};
 use crate::pins::{self, NEWEST_PYTHON};
 use crate::proc::Cmd;
-use crate::report::{Finding, Kind, StackReport, Upgrade};
+use crate::report::{Confidence, Finding, Kind, StackReport, Upgrade};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 /// E902 (io-error) is selected so a file ruff cannot read is reported, not skipped.
-pub const SELECT: &str = "UP,FURB,PTH,SIM,E902";
+pub const SELECT: &str = "UP,FURB,PTH,SIM,PERF101,PERF102,PERF401,PERF403,C4,RUF005,RUF015,RUF017,PLR1714,PLR1730,PLR1733,PLR1736,FLY002,E902";
+/// The selectors of the shortening families inside `SELECT`. Their findings
+/// are `high` only when ruff's own fix is `safe`, else `low`.
+const SHORTENING: [&str; 13] =
+    ["PERF101", "PERF102", "PERF401", "PERF403", "C4", "RUF005", "RUF015", "RUF017", "PLR1714", "PLR1730", "PLR1733", "PLR1736", "FLY002"];
 /// Oldest target ruff accepts.
 const RUFF_MIN: (u32, u32) = (3, 7);
 
@@ -142,6 +147,7 @@ struct Hit {
     column: u32,
     code: String,
     message: String,
+    confidence: Confidence,
 }
 
 impl Hit {
@@ -158,7 +164,7 @@ impl Hit {
             message: self.message.clone(),
             kind,
             source: "tool",
-            confidence: crate::report::Confidence::High,
+            confidence: self.confidence,
             upgrade,
         }
     }
@@ -202,10 +208,25 @@ fn ruff_run(ctx: &Ctx, ruff: &Path, copy: &Path, files: &[String], target: (u32,
                 broken.entry(file).or_insert_with(|| format!("ruff could not read it: {message}"));
                 continue;
             }
-            hits.push(Hit { file, line: num("/location/row"), column: num("/location/column"), code: code.to_string(), message: message.to_string() });
+            let safe_fix = item.pointer("/fix/applicability").and_then(Value::as_str) == Some("safe");
+            let confidence = confidence_for(code, safe_fix);
+            hits.push(Hit {
+                file,
+                line: num("/location/row"),
+                column: num("/location/column"),
+                code: code.to_string(),
+                message: message.to_string(),
+                confidence,
+            });
         }
     }
     Ok((hits, broken))
+}
+
+/// `high` for every code but the shortening families, which are `high`
+/// only with a safe fix: ruff's other fixes may change behaviour.
+fn confidence_for(code: &str, safe_fix: bool) -> Confidence {
+    if safe_fix || !SHORTENING.iter().any(|selector| code.starts_with(selector)) { Confidence::High } else { Confidence::Low }
 }
 
 /// `(file, why)` of each `Failed to lint <file>: <why>` line on ruff's stderr
@@ -240,6 +261,20 @@ fn pin_for(change: &Change, file: &str) -> Pin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortening_families_are_selected_and_high_only_with_a_safe_fix() {
+        let selected: Vec<&str> = SELECT.split(',').collect();
+        assert!(SHORTENING.iter().all(|s| selected.contains(s)), "{selected:?}");
+        assert_eq!(confidence_for("PLR1736", true), Confidence::High);
+        assert_eq!(confidence_for("PLR1736", false), Confidence::Low);
+        assert_eq!(confidence_for("C408", false), Confidence::Low);
+        assert_eq!(confidence_for("C408", true), Confidence::High);
+        // The older families are never downgraded.
+        assert_eq!(confidence_for("UP006", false), Confidence::High);
+        assert_eq!(confidence_for("PTH118", false), Confidence::High);
+        assert_eq!(confidence_for("SIM108", false), Confidence::High);
+    }
 
     #[test]
     fn lint_failures_name_the_file() {

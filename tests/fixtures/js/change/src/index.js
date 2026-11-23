@@ -21,4 +21,16 @@ const grouped = [{ k: 1 }].reduce((acc, x) => { (acc[x.k] ??= []).push(x); retur
 [1].forEach((n) => n); // OLD:no-for-each:modern
 const fromAsync = (async () => { const out = []; for await (const v of gen()) out.push(v); return out; })(); // OLD:prefer-array-from-async:needs-newer
 const escaped = 'a.b'.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // OLD:prefer-regexp-escape:needs-newer
+const nums = [3, 1, 2];
+for (let i = 0; i < nums.length; i++) { console.log(nums[i]); } // OLD:no-for-loop:modern
+const spread = [...[1, 2]]; // OLD:no-useless-spread:modern
+const tail = nums.slice(nums.length - 1); // OLD:prefer-negative-index:modern
+const part = 'abc'.substr(1, 2); // OLD:prefer-string-slice:modern
+const mid = 'abc'.substring(1); // OLD:prefer-string-slice:modern
+const rest = 'abc'.substr(...nums); // OLD:prefer-string-slice:modern
+for (const n of [...nums]) console.log(n); // OLD:no-useless-spread:modern
+const sortedNums = nums.sort(); // OLD:no-array-sort:needs-newer
+const reversedNums = nums.reverse(); // OLD:no-array-reverse:needs-newer
+const sliced = 'abc'.slice(1); // DECOY
+const looped = () => { for (const n of nums) console.log(n); }; // DECOY
 module.exports = { untouched, fs, count, fixed, kept, ok, ok2, p, resolve, axios, letters, lastBig, grouped, fromAsync, escaped };

@@ -38,6 +38,13 @@ export const UNICORN = [
   'prefer-group-by',
   'prefer-array-from-async',
   'prefer-regexp-escape',
+  // Shorter code: no-array-sort and no-array-reverse (toSorted/toReversed, ES2023) have no autofix.
+  'no-for-loop',
+  'no-useless-spread',
+  'prefer-negative-index',
+  'prefer-string-slice',
+  'no-array-sort',
+  'no-array-reverse',
 ];
 
 // typescript-eslint rules that need type information (projectService).

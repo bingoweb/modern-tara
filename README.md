@@ -16,7 +16,7 @@ modern-tara bir değişikliğe bakar, hangi dillere dokunduğunu ve projenin sü
 | CSS | stylelint, use-baseline, @eslint/css | `browserslist` |
 | Go | `go fix` modernleştiricileri (cmd/fix, `go vet -vettool` ile) | go.mod `go` satırı |
 
-Hiçbir kuralın yakalamadığı birkaç kalıp için ast-grep kuralları da var.
+Hiçbir kuralın yakalamadığı birkaç kalıp için ast-grep kuralları da var. Aynı işi daha kısa yapan bir yapı varken uzun yazılmış kodu da gösterir; aracın kendi düzeltmesi güvenli değilse bunu yalnızca uyarı olarak yazar.
 
 ## Bulgu türleri
 

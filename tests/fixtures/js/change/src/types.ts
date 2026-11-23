@@ -7,3 +7,7 @@ export function chained(box: Box | undefined): number | undefined {
 export function modern(box: Box | undefined): number | undefined {
   return box?.inner?.value; // DECOY
 }
+
+export function sortedCopy(xs: number[]): number[] {
+  return xs.sort(); // OLD:no-array-sort:needs-newer
+}

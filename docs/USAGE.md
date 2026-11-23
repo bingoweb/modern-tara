@@ -152,7 +152,7 @@ modern-tara: gate stopped (2 high-confidence modern findings)
 ## JSON
 
 ```json
-{ "tool": "modern-tara", "version": "0.5.0", "repo": "C:/...",
+{ "tool": "modern-tara", "version": "0.6.0", "repo": "C:/...",
   "change": { "mode": "range|staged|worktree|files", "from", "to", "all_lines", "files", "changed_lines", "git_safe",
               "merge_base", "unmatched": [] },
   "stacks": [ { "stack", "files": [], "pins": {}, "newest": {}, "tool": "ruff 0.17.6",
@@ -202,7 +202,8 @@ Confidence:
   `csharp-httpclient-per-call`, `csharp-new-random`, `python-asyncio-gather`,
   `javascript-http-client-package` and its `typescript-` and `tsx-` twins,
   `go-ioutil-readdir`, `go-math-rand-v2`, `rust-oncelock-static-lazylock-captures`.
-  Also low: stylelint `declaration-block-no-redundant-longhand-properties`
+  Also low: the shortening families without a mechanical fix (see
+  [Shortening rules](#shortening-rules)), stylelint `declaration-block-no-redundant-longhand-properties`
   (see [Rule selection](#rule-selection)), `go/omitzero` (its fix changes
   encoding/json output) and any `go fix` analyzer not yet in `ANALYZERS` in
   `src/stacks/go.rs`.
@@ -339,6 +340,40 @@ shorthands newer than their longhands (`inset`, `inset-block`, `inset-inline`,
 `place-items`, `place-content`, `place-self`, `overflow`), as `modern` with
 `low` confidence; its other findings (`margin`, `list-style`, …) are dropped.
 
+### Shortening rules
+
+Rules that turn long code into a shorter construct are kept too, with one
+principle: a finding is `high` only when its tool's own fix is mechanical and
+safe, otherwise `low` (a warning that never stops `--gate`). Every finding is
+`modern`. The families that existed before 0.6.0 keep their confidence.
+
+| stack | rules | `high` when | `low` otherwise |
+|---|---|---|---|
+| Python | ruff `PERF101 PERF102 PERF401 PERF403 C4 RUF005 RUF015 RUF017 PLR1714 PLR1730 PLR1733 PLR1736 FLY002` | the JSON record has a `fix` with `applicability: "safe"` | the fix is `unsafe` or `display`, or there is none (ruff makes a fix unsafe when a comment sits inside it) |
+| Rust | clippy `SHORTENING` in `src/stacks/rust.rs`: filter_next, map_clone, explicit_counter_loop, bool_comparison, needless_bool, unnecessary_fold, iter_nth_zero, len_zero, single_char_pattern, implicit_clone, collapsible_else_if, unnecessary_lazy_evaluations, redundant_closure | a child span has `suggestion_applicability: "MachineApplicable"` | `MaybeIncorrect` and the rest (`explicit_counter_loop`) |
+| C# | IDE0074 IDE0031 IDE0029 IDE0030 IDE0270, CA1829 CA1865 CA1847 CA1858 CA1872 | always (Roslyn code fixes are mechanical) | - |
+| C# | CA1866 | never | always: its fix swaps a culture-aware string comparison for an ordinal char one (`"\u00ADabc".StartsWith("a")` is true, `StartsWith('a')` false) |
+| JS/TS | unicorn `no-useless-spread`, `prefer-negative-index`, `prefer-string-slice` (`substr()` findings) | the ESLint message carries a `fix` | no `fix` (a suggestion alone does not count) |
+| JS/TS | unicorn `prefer-string-slice` on `substring()` | never | always: its fix `s.slice(Math.max(0, start))` is longer and `substring` is not deprecated |
+| JS/TS | unicorn `no-for-loop` | never | always: its for-of fix changes behaviour on strings (UTF-16 units against code points) and unicorn cannot tell strings from arrays |
+| JS/TS | unicorn `no-array-sort`, `no-array-reverse` (`toSorted`/`toReversed`, ES2023) | never | always: there is no autofix and the mutation may be intended |
+
+`manual_ok_or` and `iter_kv_map` are in the same spirit but were already kept
+(`manual_*`, `MODERN_EXTRA`), so they stay `high`. `option_map_unit_fn` is not run:
+its fix is longer and clashes with `redundant_closure`.
+
+Known limits. CA1829 (`Count()` instead of the `Count` property) also fires on
+a custom type's own `Count` property, a Roslyn limitation; its fix is
+mechanical for the common case, so it stays `high`. The ES2023 check
+(`no-array-sort`, `no-array-reverse`) reads only the `compilerOptions.target` of
+the nearest `tsconfig.json`, not `references`, `extends` or `lib`, so a target
+set elsewhere is not seen; these findings are always `low`.
+
+**PowerShell adds nothing.** No PSScriptAnalyzer rule replaces long code with a
+shorter construct: its rules are about correctness, security, naming, aliases
+and whitespace, none about a shorter equivalent, so a rule here would only be
+style.
+
 ## Stacks
 
 **C#** (`.cs`). Pins: nearest `*.csproj`, then the `Directory.Build.props` chain
@@ -348,9 +383,10 @@ with the props, `nuget.config` and `.editorconfig` above them. A
 `modern-tara.slnx` is generated and restored in each copy. The two copies then
 run in parallel: `dotnet format style` with IDE0019 IDE0020 IDE0028 IDE0038
 IDE0041 IDE0066 IDE0078 IDE0083 IDE0161 IDE0290 IDE0300-IDE0306 IDE0330
-IDE0360 IDE0090 IDE0057 IDE0056, and `dotnet format analyzers` with CA1510
-CA1511 CA1512 CA1513 CA1839 CA1854 CA1860 CA1863 CA1870 CA1877 CA2263
-SYSLIB1045 SYSLIB1054. A section appended to the copy's root `.editorconfig`
+IDE0360 IDE0090 IDE0057 IDE0056 IDE0074 IDE0031 IDE0029 IDE0030 IDE0270, and
+`dotnet format analyzers` with CA1510 CA1511 CA1512 CA1513 CA1839 CA1854
+CA1860 CA1863 CA1870 CA1877 CA2263 SYSLIB1045 SYSLIB1054 CA1829 CA1865 CA1866
+CA1847 CA1858 CA1872 (all present in the .NET 10 and .NET 11 SDKs). A section appended to the copy's root `.editorconfig`
 sets these IDs to `suggestion` and picks the modern style options (for
 example, file-scoped namespaces). A closer `.editorconfig` still wins. Messages
 are in English because of `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1`.
@@ -371,9 +407,10 @@ copied, but `rust-toolchain*` is left out, so rustup never installs anything.
 The tool runs `cargo clippy --message-format=json --workspace --all-targets --keep-going -- --force-warn <groups and lints>`
 (`--workspace`: every member of a workspace whose root is also a package).
 It reports only modern-idiom lints: `WARN`, every `manual_*` lint,
-`MODERN_EXTRA` in `src/stacks/rust.rs` (map_unwrap_or, io_other_error,
-legacy_numeric_constants, question_mark, ptr_as_ptr, …), and any message that
-mentions stabilization or MSRV. A second copy gets `rust-version` raised to the
+`MODERN_EXTRA` and `SHORTENING` in `src/stacks/rust.rs` (map_unwrap_or,
+io_other_error, legacy_numeric_constants, question_mark, ptr_as_ptr, …; the
+shortening lints are listed under [Shortening rules](#shortening-rules)), and
+any message that mentions stabilization or MSRV. A second copy gets `rust-version` raised to the
 toolchain version and edition 2024 (if older), and clippy msrv is removed.
 `clippy::incompatible_msrv` in the base run is `needs-newer`, with
 `rust-version` raised to the version the lint names. Findings that appear only
@@ -393,10 +430,11 @@ when a `Cargo.toml` is above it.
 
 **Python** (`.py .pyi`). Pins: nearest `pyproject.toml` `requires-python`,
 else `.python-version`, else unknown (assumed 3.15). The tool runs
-`ruff check --no-cache --isolated --ignore-noqa --select UP,FURB,PTH,SIM,E902 --target-version pyXY`
+`ruff check --no-cache --isolated --ignore-noqa --select UP,FURB,PTH,SIM,PERF101,PERF102,PERF401,PERF403,C4,RUF005,RUF015,RUF017,PLR1714,PLR1730,PLR1733,PLR1736,FLY002,E902 --target-version pyXY`
 with no `--preview`, then the same at `py315`. Findings that only the newer
 targets show are `needs-newer`. `to` is the first target that shows them,
-found by running each version in between. E902 (io-error) is never a finding:
+found by running each version in between. The PERF, C4, RUF and PLR codes are
+the [shortening rules](#shortening-rules): `high` only with a `safe` fix. E902 (io-error) is never a finding:
 a file ruff cannot read (for example Windows-1254 bytes, which are not UTF-8,
 ruff's `Failed to lint ... not valid UTF-8`) is an unscanned file.
 
@@ -415,7 +453,11 @@ ESLint runs through `js/modern-tara.mjs` with the tool-owned flat config
   prefer-import-meta-properties, prefer-string-starts-ends-with, prefer-spread,
   prefer-modern-dom-apis, prefer-modern-math-apis, prefer-object-from-entries,
   prefer-optional-catch-binding, no-for-each, prefer-group-by,
-  prefer-array-from-async, prefer-regexp-escape.
+  prefer-array-from-async, prefer-regexp-escape, and the
+  [shortening rules](#shortening-rules) no-useless-spread,
+  prefer-negative-index, prefer-string-slice (`high` with an ESLint `fix`, else
+  `low`; `substring()` findings always `low`) and no-for-loop, no-array-sort,
+  no-array-reverse (always `low`).
 - typescript-eslint: prefer-for-of. With a tsconfig, `projectService` also
   enables prefer-optional-chain, prefer-nullish-coalescing, prefer-includes and
   prefer-string-starts-ends-with. TypeScript reads the repository's
@@ -425,7 +467,11 @@ ESLint runs through `js/modern-tara.mjs` with the tool-owned flat config
 `RULES` in `src/stacks/js.rs` maps each rule to the first Node version that
 supports it. Above the lower bound of `engines.node` the finding is
 `needs-newer` (`to: "26"`). TS syntax rules stay `modern`, because tsc
-compiles them down.
+compiles them down. no-array-sort and no-array-reverse need ES2023: they are
+`needs-newer` below Node 20, and in a TypeScript file whose nearest tsconfig
+`compilerOptions.target` is below ES2023 (`upgrade.pin` is `tsconfig target`,
+`to` `ES2023`; only the nearest tsconfig's own `target` is read: not `extends`,
+`references` or `lib`).
 
 eslint-plugin-es-x adds a `baseline` check for JS files. It covers ES2022+
 features only, from the per-feature table `ES_X` in `src/stacks/js.rs`, which

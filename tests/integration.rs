@@ -217,9 +217,72 @@ fn python_fixture() {
     check("python");
 }
 
+/// The confidences of `rule` among the findings of a report.
+fn confidences<'a>(v: &'a Value, rule: &str) -> Vec<&'a str> {
+    v["findings"].as_array().unwrap().iter().filter(|f| f["rule"].as_str().is_some_and(|r| r.contains(rule))).filter_map(|f| f["confidence"].as_str()).collect()
+}
+
+/// ruff's shortening families: `high` only where ruff's own fix is `safe`,
+/// else `low`; every selected code is listed in `rules`.
+#[test]
+fn python_shortening_rules_are_high_only_with_a_safe_fix() {
+    let Some((report, v)) = check_fixture_doc("python", "python") else { return };
+    assert_eq!(confidences(&v, "PLR1736"), ["high"]);
+    assert_eq!(confidences(&v, "RUF015"), ["low"]);
+    assert_eq!(confidences(&v, "C411"), ["low"]);
+    assert_eq!(confidences(&v, "PERF102"), ["low"]);
+    // The older families keep `high`.
+    assert_eq!(confidences(&v, "PTH118"), ["high"]);
+    let rules: Vec<&str> = report["rules"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    for id in ["PERF101", "PERF102", "PERF401", "PERF403", "C4", "RUF005", "RUF015", "RUF017", "PLR1714", "PLR1730", "PLR1733", "PLR1736", "FLY002"] {
+        assert!(rules.contains(&id), "{id} in {rules:?}");
+    }
+}
+
+/// ruff downgrades a fix to unsafe when a comment sits inside it, so the
+/// `safe` case (PLR1730, `max()`) is scanned in code with no comment.
+#[test]
+fn python_safe_fix_is_high_and_an_unsafe_one_low() {
+    let code = "def clamp(items):
+    limit = 0
+    if limit < 3:
+        limit = 3
+    return list(items)[0], limit
+";
+    let r = python_repo("shorter-safe", ">=3.12", code);
+    let (_, v) = scan(&r.0, &["--all-lines", "--stacks", "python"]);
+    if python_unusable(&v) {
+        return;
+    }
+    assert_eq!(confidences(&v, "PLR1730"), ["high"], "{v}");
+    assert_eq!(confidences(&v, "RUF015"), ["low"], "{v}");
+}
+
 #[test]
 fn rust_fixture() {
     check("rust");
+}
+
+/// clippy's shortening lints: `high` only when its suggestion is
+/// `MachineApplicable`; `explicit_counter_loop` is `MaybeIncorrect`, so `low`.
+#[test]
+fn rust_shortening_lints_are_high_only_when_machine_applicable() {
+    let Some((report, v)) = check_fixture_doc("rust", "rust") else { return };
+    for lint in ["filter_next", "map_clone", "len_zero", "bool_comparison", "needless_bool", "unnecessary_fold", "redundant_closure", "collapsible_else_if"] {
+        let got = confidences(&v, &format!("clippy::{lint}"));
+        assert!(!got.is_empty() && got.iter().all(|c| *c == "high"), "{lint}: {got:?}");
+    }
+    assert_eq!(confidences(&v, "clippy::explicit_counter_loop"), ["low"]);
+    // The older lints keep `high`.
+    let old = confidences(&v, "clippy::uninlined_format_args");
+    assert!(!old.is_empty() && old.iter().all(|c| *c == "high"), "{old:?}");
+    let rules: Vec<&str> = report["rules"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    for lint in ["filter_next", "iter_nth_zero", "single_char_pattern", "unnecessary_lazy_evaluations", "redundant_closure"] {
+        assert!(rules.contains(&format!("clippy::{lint}").as_str()), "{lint} in {rules:?}");
+    }
+    // Its fix is longer and clashes with redundant_closure: not run, never reported.
+    assert!(!rules.contains(&"clippy::option_map_unit_fn"), "{rules:?}");
+    assert_eq!(confidences(&v, "clippy::option_map_unit_fn"), Vec::<&str>::new());
 }
 
 /// Edition 2021 + rust-version 1.70: let chains (`collapsible_if`), `LazyLock`
@@ -235,7 +298,12 @@ fn rust_raised_pass_fixture() {
 /// not claim the .NET 11 SDK is missing. A8: the report lists the IDE/CA ids.
 #[test]
 fn csharp_fixture() {
-    let Some(report) = check_fixture("csharp", "csharp") else { return };
+    let Some((report, v)) = check_fixture_doc("csharp", "csharp") else { return };
+    // CA1866's fix swaps a culture-aware comparison for an ordinal one: a warning only.
+    assert_eq!(confidences(&v, "CA1866"), ["low"]);
+    for id in ["CA1865", "CA1847", "IDE0074", "CA1858"] {
+        assert_eq!(confidences(&v, id), ["high"], "{id}");
+    }
     let sdks = Command::new(installed("dotnet").unwrap()).arg("--list-sdks").output().unwrap();
     let has_11 = String::from_utf8_lossy(&sdks.stdout).lines().any(|l| l.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| m >= 11));
     let message = report["message"].as_str().unwrap();
@@ -243,7 +311,24 @@ fn csharp_fixture() {
         assert!(!message.contains("need the .NET 11 SDK"), "SDK 11 is installed: {message}");
     }
     let rules: Vec<&str> = report["rules"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
-    for id in ["IDE0090", "IDE0300", "CA1510", "SYSLIB1045", "csharp-new-random"] {
+    for id in [
+        "IDE0090",
+        "IDE0300",
+        "CA1510",
+        "SYSLIB1045",
+        "csharp-new-random",
+        "IDE0074",
+        "IDE0031",
+        "IDE0029",
+        "IDE0030",
+        "IDE0270",
+        "CA1829",
+        "CA1865",
+        "CA1866",
+        "CA1847",
+        "CA1858",
+        "CA1872",
+    ] {
         assert!(rules.contains(&id), "{id} in {rules:?}");
     }
 }
@@ -736,6 +821,92 @@ fn js_group_by_is_modern_on_node_22() {
     }
     let found = v["findings"].as_array().unwrap().iter().any(|f| f["rule"] == "unicorn/prefer-group-by" && f["kind"] == "modern");
     assert!(found, "{v}");
+}
+
+/// The confidence of `rule` on the first line of the js fixture file `file` that contains `needle`.
+fn js_confidence_at(v: &Value, file: &str, needle: &str, rule: &str) -> String {
+    let text = fs::read_to_string(fixtures().join("js").join("change").join(file)).unwrap();
+    let line = u64::try_from(text.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle}")) + 1).unwrap();
+    let found = v["findings"].as_array().unwrap().iter().find(|f| f["file"] == file && f["line"] == line && f["rule"] == rule);
+    found.unwrap_or_else(|| panic!("{rule} at {file}:{line}: {v}"))["confidence"].as_str().unwrap().to_string()
+}
+
+/// unicorn's shortening rules: `high` only when `ESLint`'s message carries a
+/// fix. `no-for-loop` (strings iterate by code point), `substring()` (its fix
+/// is longer) and `no-array-sort`/`no-array-reverse` (no fix; with the Node
+/// pin below 20 also `needs-newer`) are always `low`.
+#[test]
+fn js_shortening_rules_are_high_only_with_an_autofix() {
+    let Some((report, v)) = check_fixture_doc("js", "js") else { return };
+    let at = |needle: &str, rule: &str| js_confidence_at(&v, "src/index.js", needle, &format!("unicorn/{rule}"));
+    assert_eq!(at("for (let i = 0", "no-for-loop"), "low");
+    assert_eq!(at("[...[1, 2]]", "no-useless-spread"), "high");
+    assert_eq!(at("nums.length - 1", "prefer-negative-index"), "high");
+    assert_eq!(at("'abc'.substr(1, 2)", "prefer-string-slice"), "high");
+    assert_eq!(at("'abc'.substring(1)", "prefer-string-slice"), "low");
+    // Reported without a fix: the fix-gated rules must come out low.
+    assert_eq!(at("'abc'.substr(...nums)", "prefer-string-slice"), "low");
+    assert_eq!(at("of [...nums]", "no-useless-spread"), "low");
+    for rule in ["no-array-sort", "no-array-reverse"] {
+        let got = confidences(&v, &format!("unicorn/{rule}"));
+        assert!(!got.is_empty() && got.iter().all(|c| *c == "low"), "{rule}: {got:?}");
+    }
+    let rules: Vec<&str> = report["rules"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    for rule in ["no-for-loop", "no-useless-spread", "prefer-negative-index", "prefer-string-slice", "no-array-sort", "no-array-reverse"] {
+        assert!(rules.contains(&format!("unicorn/{rule}").as_str()), "{rule} in {rules:?}");
+    }
+}
+
+/// With Node 22 the two ES2023 rules are `modern` in JS, but a TypeScript
+/// file whose tsconfig `target` is below ES2023 stays `needs-newer` (its
+/// upgrade names the tsconfig); with `ESNext` it is `modern`.
+#[test]
+fn js_to_sorted_follows_the_es_target() {
+    for (target, kind) in [("ES2022", "needs-newer"), ("ESNext", "modern")] {
+        let r = repo("js");
+        fs::write(
+            r.0.join("package.json"),
+            "{
+  \"name\": \"fixture-js\",
+  \"private\": true,
+  \"type\": \"commonjs\",
+  \"engines\": { \"node\": \">=22\" }
+}
+",
+        )
+        .unwrap();
+        let tsconfig = format!(
+            "{{
+  \"compilerOptions\": {{ \"strict\": true, \"target\": \"{target}\", \"module\": \"ESNext\", \"moduleResolution\": \"Bundler\", \"noEmit\": true }},
+  \"include\": [\"src/**/*.ts\"]
+}}
+"
+        );
+        fs::write(r.0.join("tsconfig.json"), tsconfig).unwrap();
+        git(&r.0, &["add", "-A"]);
+        git(&r.0, &["commit", "-q", "--no-verify", "-m", "raise node"]);
+        let (_, v) = scan(&r.0, &["--range", "HEAD~2..HEAD", "--stacks", "js"]);
+        if v["stacks"][0]["status"] == "skipped" {
+            eprintln!("js: skipped ({})", v["stacks"][0]["message"]);
+            return;
+        }
+        let of = |file: &str| -> Value {
+            v["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["file"] == file && f["rule"] == "unicorn/no-array-sort")
+                .cloned()
+                .unwrap_or_else(|| panic!("{file}: {v}"))
+        };
+        let ts = of("src/types.ts");
+        assert_eq!((ts["kind"].as_str(), ts["confidence"].as_str()), (Some(kind), Some("low")), "{target}: {ts}");
+        if kind == "needs-newer" {
+            assert_eq!(ts["upgrade"]["pin"], "tsconfig target", "{ts}");
+        }
+        let js = of("src/index.js");
+        assert_eq!((js["kind"].as_str(), js["confidence"].as_str()), (Some("modern"), Some("low")), "{js}");
+    }
 }
 
 /// `--gate`: a high-confidence `modern` finding stops the gate (exit 1).

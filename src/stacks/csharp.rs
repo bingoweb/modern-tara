@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Code-style rules (`dotnet format style`), with the construct and release.
-pub const STYLE: [(&str, &str); 22] = [
+pub const STYLE: [(&str, &str); 27] = [
     ("IDE0019", "pattern matching instead of `as` + null check (C# 7)"),
     ("IDE0020", "pattern matching instead of `is` + cast (C# 7)"),
     ("IDE0028", "collection initializer or expression (C# 12)"),
@@ -38,10 +38,20 @@ pub const STYLE: [(&str, &str); 22] = [
     ("IDE0090", "target-typed `new()` (C# 9)"),
     ("IDE0057", "range operator `[a..b]` (C# 8)"),
     ("IDE0056", "index operator `[^1]` (C# 8)"),
+    ("IDE0074", "coalesce compound assignment `??=` (C# 8)"),
+    ("IDE0031", "null propagation `?.` (C# 6)"),
+    ("IDE0029", "null coalescing `??` (C# 2)"),
+    ("IDE0030", "null coalescing `??` on a nullable value (C# 2)"),
+    ("IDE0270", "`?? throw` (C# 7)"),
 ];
 
+/// Findings that are `low`: the code fix is not behaviour-neutral. CA1866
+/// swaps a culture-aware string comparison for an ordinal char one
+/// (`"\u{ad}abc".StartsWith("a")` is true, `StartsWith('a')` false).
+const LOW_CONFIDENCE: [&str; 1] = ["CA1866"];
+
 /// Analyzer rules (`dotnet format analyzers`).
-pub const ANALYZERS: [(&str, &str); 13] = [
+pub const ANALYZERS: [(&str, &str); 19] = [
     ("CA1510", "`ArgumentNullException.ThrowIfNull` (.NET 6)"),
     ("CA1511", "`ArgumentException.ThrowIfNullOrEmpty` (.NET 7)"),
     ("CA1512", "`ArgumentOutOfRangeException.ThrowIf*` (.NET 8)"),
@@ -55,6 +65,12 @@ pub const ANALYZERS: [(&str, &str); 13] = [
     ("CA2263", "generic overload instead of `Type` argument (.NET 5+)"),
     ("SYSLIB1045", "`[GeneratedRegex]` (.NET 7)"),
     ("SYSLIB1054", "`[LibraryImport]` (.NET 7)"),
+    ("CA1829", "`Length`/`Count` property instead of `Count()`"),
+    ("CA1865", "char overload for a single-character string argument (.NET Core 2.1+)"),
+    ("CA1866", "char overload for a single-character string argument (.NET Core 2.1+)"),
+    ("CA1847", "char literal for a single-character lookup (.NET Core 2.1+)"),
+    ("CA1858", "`StartsWith` instead of `IndexOf` compared with 0"),
+    ("CA1872", "`Convert.ToHexString` (.NET 5)"),
 ];
 
 /// Style preferences that make the rules above fire; appended last to the
@@ -77,6 +93,9 @@ csharp_prefer_system_threading_lock = true:suggestion
 csharp_style_prefer_simple_property_accessors = true:suggestion
 dotnet_style_prefer_is_null_check_over_reference_equality_method = true:suggestion
 dotnet_style_collection_initializer = true:suggestion
+dotnet_style_coalesce_expression = true:suggestion
+dotnet_style_null_propagation = true:suggestion
+dotnet_style_prefer_compound_assignment = true:suggestion
 ";
 
 const BUILD_FILES: [&str; 7] =
@@ -409,7 +428,7 @@ fn format_pass(ctx: &Ctx, dotnet: &Path, copy: &Path, sub: &str, ids: &[&str], f
                 message: format!("{text} — {construct}"),
                 kind: Kind::Modern,
                 source: "tool",
-                confidence: crate::report::Confidence::High,
+                confidence: if LOW_CONFIDENCE.contains(&id) { crate::report::Confidence::Low } else { crate::report::Confidence::High },
                 upgrade: None,
             });
         }
@@ -452,6 +471,12 @@ mod tests {
             source,
             upgrade: None,
         }
+    }
+
+    #[test]
+    fn only_ca1866_is_low() {
+        assert_eq!(LOW_CONFIDENCE, ["CA1866"]);
+        assert!(ANALYZERS.iter().any(|(id, _)| *id == "CA1866") && !LOW_CONFIDENCE.contains(&"CA1865") && !LOW_CONFIDENCE.contains(&"CA1847"));
     }
 
     #[test]

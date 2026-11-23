@@ -125,7 +125,8 @@ async function runEslint() {
           strictNullNote = true;
           continue;
         }
-        results.push({ file, line: m.line, column: m.column, rule: m.ruleId, message: m.message });
+        // `fixable`: ESLint offers an autofix (a suggestion alone does not count).
+        results.push({ file, line: m.line, column: m.column, rule: m.ruleId, message: m.message, fixable: Boolean(m.fix) });
       }
     }
     if (retry.length > 0 && attempt === 0) {

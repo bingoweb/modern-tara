@@ -7,7 +7,7 @@ use super::{Ctx, astgrep};
 use crate::change::{self, Change};
 use crate::pins::{self, NEWEST_EDITION, NEWEST_RUST};
 use crate::proc::Cmd;
-use crate::report::{Finding, Kind, StackReport, Upgrade};
+use crate::report::{Confidence, Finding, Kind, StackReport, Upgrade};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Passed with `--force-warn` (like `MODERN_EXTRA`, `RAISED_ONLY` and
+/// Passed with `--force-warn` (like `MODERN_EXTRA`, `SHORTENING`, `RAISED_ONLY` and
 /// `FORCE_GROUPS`), so an `#[allow]` in the code never hides them.
 pub const WARN: [&str; 15] = [
     "manual_let_else",
@@ -78,6 +78,27 @@ pub const MODERN_EXTRA: [&str; 38] = [
     "obfuscated_if_else",
 ];
 
+/// Lints (default or pedantic) that turn long code into a shorter construct.
+/// Their findings are `high` only when clippy's suggestion is
+/// `MachineApplicable`, else `low`. `manual_ok_or` and `iter_kv_map` belong
+/// here too but are already kept (`manual_*`, `MODERN_EXTRA`) with their old confidence.
+/// `option_map_unit_fn` is left out: its fix is longer and clashes with `redundant_closure`.
+pub const SHORTENING: [&str; 13] = [
+    "filter_next",
+    "map_clone",
+    "explicit_counter_loop",
+    "bool_comparison",
+    "needless_bool",
+    "unnecessary_fold",
+    "iter_nth_zero",
+    "len_zero",
+    "single_char_pattern",
+    "implicit_clone",
+    "collapsible_else_if",
+    "unnecessary_lazy_evaluations",
+    "redundant_closure",
+];
+
 /// Style lints that are only modern when the raised run alone reports them:
 /// `collapsible_if` on `if let` nesting fires only with edition 2024 and
 /// Rust 1.88+ (let chains). Recorded in both runs, reported only as needs-newer.
@@ -90,7 +111,7 @@ pub const FORCE_GROUPS: [&str; 5] = ["pedantic", "style", "complexity", "perf", 
 
 /// The clippy lints the stack reports, as the `rules` of the JSON report.
 pub fn rule_ids() -> Vec<String> {
-    WARN.iter().chain(&MODERN_EXTRA).chain(&RAISED_ONLY).chain(&["manual_*", "incompatible_msrv"]).map(|l| format!("clippy::{l}")).collect()
+    WARN.iter().chain(&MODERN_EXTRA).chain(&SHORTENING).chain(&RAISED_ONLY).chain(&["manual_*", "incompatible_msrv"]).map(|l| format!("clippy::{l}")).collect()
 }
 
 fn raised_only(name: &str) -> bool {
@@ -109,6 +130,7 @@ pub fn is_modern_lint(name: &str, message: &str) -> bool {
     lint.starts_with("manual_")
         || WARN.contains(&lint)
         || MODERN_EXTRA.contains(&lint)
+        || SHORTENING.contains(&lint)
         || ["stabilized", "stable since", "since Rust", "MSRV"].iter().any(|k| message.contains(k))
 }
 
@@ -326,6 +348,8 @@ struct Hit {
     column: u32,
     rule: String,
     message: String,
+    /// A clippy suggestion with `MachineApplicable` applicability came with it.
+    machine_applicable: bool,
 }
 
 impl Hit {
@@ -339,9 +363,16 @@ impl Hit {
             message: self.message.clone(),
             kind,
             source: "tool",
-            confidence: crate::report::Confidence::High,
+            confidence: self.confidence(),
             upgrade,
         }
+    }
+
+    /// `high`, except a `SHORTENING` lint whose suggestion clippy does not
+    /// call `MachineApplicable`.
+    fn confidence(&self) -> Confidence {
+        let shortening = SHORTENING.contains(&self.rule.trim_start_matches("clippy::"));
+        if shortening && !self.machine_applicable { Confidence::Low } else { Confidence::High }
     }
 }
 
@@ -363,7 +394,7 @@ fn clippy_run(ctx: &Ctx, cargo: &Path, cwd: &Path, target_dir: &Path, strip_cc: 
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .timeout(ctx.timeout_or(900));
     // `--force-warn` (stable): no `#[allow]`/`#[expect]` or `deny` in the code changes these.
-    for lint in FORCE_GROUPS.iter().chain(&WARN).chain(&MODERN_EXTRA).chain(&RAISED_ONLY).chain(&["incompatible_msrv"]) {
+    for lint in FORCE_GROUPS.iter().chain(&WARN).chain(&MODERN_EXTRA).chain(&SHORTENING).chain(&RAISED_ONLY).chain(&["incompatible_msrv"]) {
         cmd = cmd.arg("--force-warn").arg(format!("clippy::{lint}"));
     }
     if strip_cc {
@@ -404,7 +435,8 @@ fn clippy_run(ctx: &Ctx, cargo: &Path, cwd: &Path, target_dir: &Path, strip_cc: 
                     continue;
                 }
                 if let Some((file, line, column)) = place {
-                    hits.push(Hit { file, line, column, rule: code.to_string(), message: text });
+                    let machine_applicable = machine_applicable(msg);
+                    hits.push(Hit { file, line, column, rule: code.to_string(), message: text, machine_applicable });
                 }
             }
             _ => {}
@@ -417,6 +449,13 @@ fn clippy_run(ctx: &Ctx, cargo: &Path, cwd: &Path, target_dir: &Path, strip_cc: 
         error = Some(out.tail(3));
     }
     Ok(ClippyRun { hits, error })
+}
+
+/// Whether a clippy message carries a suggestion clippy calls
+/// `MachineApplicable` (`children[].spans[].suggestion_applicability`).
+fn machine_applicable(message: &Value) -> bool {
+    let spans = message.get("children").and_then(Value::as_array).into_iter().flatten().filter_map(|c| c.get("spans")?.as_array()).flatten();
+    spans.filter_map(|s| s.get("suggestion_applicability")?.as_str()).any(|a| a == "MachineApplicable")
 }
 
 /// Workspaces holding the changed files, and files with no manifest above.
@@ -695,6 +734,35 @@ mod tests {
         assert!(is_modern_lint("clippy::incompatible_msrv", m));
         assert_eq!(msrv_needed(m).as_deref(), Some("1.80"));
         assert_eq!(msrv_needed("no version here"), None);
+    }
+
+    #[test]
+    fn shortening_lints_are_kept_and_listed() {
+        for lint in SHORTENING {
+            assert!(is_modern_lint(&format!("clippy::{lint}"), ""), "{lint}");
+            assert!(rule_ids().contains(&format!("clippy::{lint}")), "{lint}");
+        }
+        assert!(!is_modern_lint("clippy::needless_return", ""));
+        assert!(!is_modern_lint("clippy::option_map_unit_fn", ""));
+    }
+
+    #[test]
+    fn shortening_lints_are_high_only_when_machine_applicable() {
+        let hit =
+            |rule: &str, machine_applicable| Hit { file: "a.rs".into(), line: 1, column: 1, rule: rule.into(), message: String::new(), machine_applicable };
+        assert_eq!(hit("clippy::filter_next", true).confidence(), Confidence::High);
+        assert_eq!(hit("clippy::explicit_counter_loop", false).confidence(), Confidence::Low);
+        // The older lints are never downgraded.
+        assert_eq!(hit("clippy::manual_let_else", false).confidence(), Confidence::High);
+        assert_eq!(hit("clippy::iter_kv_map", false).confidence(), Confidence::High);
+    }
+
+    #[test]
+    fn machine_applicability_is_read_from_the_children() {
+        let m = |a: &str| json!({"children": [{"spans": []}, {"spans": [{"suggestion_applicability": a}]}]});
+        assert!(machine_applicable(&m("MachineApplicable")));
+        assert!(!machine_applicable(&m("MaybeIncorrect")));
+        assert!(!machine_applicable(&json!({"spans": [{"suggestion_applicability": "MachineApplicable"}]})));
     }
 
     #[test]
