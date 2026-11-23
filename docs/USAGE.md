@@ -636,7 +636,10 @@ To move a pin: edit `tools.toml` (and, for npm, the exact versions in
     args: --stacks rust,python,go
 ```
 
-Inputs: `version` (a release tag; default the tag the action is used at),
+Inputs: `version` (a release tag, v0.5.0 or newer because the action passes
+`--range a...b` and `--allow-skipped`, which older releases reject, and the
+action refuses an older tag with that reason; default the tag the action is
+used at),
 `range` (`a..b` or `a...b`; default: for a pull request `base...head`, that is
 `merge-base(base, head)..head`, else
 `github.event.before..github.sha`, or `sha~1..sha` for a new branch), `args`
@@ -648,6 +651,14 @@ unscanned file fails the gate). A push whose `before` is gone
 (force push) first fetches that commit; if it is still missing, or `before`
 is all zeros, the range is `sha~1..sha`, and a root commit is scanned with
 `--all-lines`.
+
+Merge bases and older revisions need the history, so when the checkout is
+shallow the action runs `git fetch --unshallow origin` (when no `range` is
+given, or the `range` holds `...`) and, for a pull request, fetches the base
+and head commits. If a fetch fails, the step stops and says what could not be
+fetched: use `actions/checkout` with `fetch-depth: 0` (as above), and for a
+private repository a token that can read it. The step ends with the scan's own
+exit code: 1 for findings at the gate, 2 for a failed scan.
 
 The action stops on runners other than Windows or Linux x64. It sets up
 Node 26 with `actions/setup-node`, which **stays on PATH for the job's later

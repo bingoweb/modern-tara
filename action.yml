@@ -3,7 +3,7 @@ description: Runs modern-tara on the changed lines and stops only on high-confid
 
 inputs:
   version:
-    description: Release tag of modern-tara to run, such as v0.4.0. Default is the tag this action is used at.
+    description: Release tag of modern-tara to run, such as v0.5.0 (0.5.0 or newer). Default is the tag this action is used at.
     required: false
     default: ""
   range:
@@ -56,6 +56,10 @@ runs:
         $ErrorActionPreference = 'Stop'
         $version = if ($env:MT_VERSION) { $env:MT_VERSION } elseif ($env:MT_ACTION_REF) { $env:MT_ACTION_REF } else { Split-Path -Leaf $env:GITHUB_ACTION_PATH }
         if ($version -notmatch '^v\d') { throw "modern-tara: set the version input to a release tag (v...); got '$version'" }
+        # This action passes `--range a...b` and `--allow-skipped`, which releases before 0.5.0 reject.
+        if ($version -match '^v(\d+)\.(\d+)\.(\d+)' -and [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])" -lt [version]'0.5.0') {
+          throw "modern-tara: version '$version' is older than this action, which needs modern-tara 0.5.0 or newer (older releases reject --range a...b and --allow-skipped); use v0.5.0 or later, or leave the version input empty"
+        }
         $repo = if ($env:MT_ACTION_REPO) { $env:MT_ACTION_REPO } else { 'bingoweb/modern-tara' }
         $target, $exe = if ($IsWindows) { 'x86_64-pc-windows-msvc', 'modern-tara.exe' } else { 'x86_64-unknown-linux-gnu', 'modern-tara' }
         $dir = Join-Path $env:RUNNER_TEMP "modern-tara-$version"
@@ -108,13 +112,18 @@ runs:
       run: |
         $ErrorActionPreference = 'Stop'
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $hint = 'use actions/checkout with fetch-depth: 0 (and, for a private repository, a token that can read it)'
+        # Merge bases (a...b) and older revisions need the history.
+        if ((-not $env:MT_RANGE -or $env:MT_RANGE.Contains('...')) -and (git rev-parse --is-shallow-repository) -eq 'true') {
+          git fetch --no-tags --quiet --unshallow origin
+          if ($LASTEXITCODE -ne 0) { throw "modern-tara: could not fetch the full history from origin (git fetch --unshallow exited $LASTEXITCODE); $hint" }
+        }
         if ($env:MT_RANGE) {
           $scope = @('--range', $env:MT_RANGE)
         } else {
-          # Merge bases and older revisions need the history.
-          if ((git rev-parse --is-shallow-repository) -eq 'true') { git fetch --no-tags --quiet --unshallow origin }
           if ($env:MT_PR_BASE -and $env:MT_PR_HEAD) {
             git fetch --no-tags --quiet origin $env:MT_PR_BASE $env:MT_PR_HEAD
+            if ($LASTEXITCODE -ne 0) { throw "modern-tara: could not fetch the pull request commits $($env:MT_PR_BASE) and $($env:MT_PR_HEAD) from origin (git fetch exited $LASTEXITCODE); $hint" }
             # base...head: modern-tara diffs head against merge-base(base, head).
             $scope = @('--range', "$($env:MT_PR_BASE)...$($env:MT_PR_HEAD)")
           } else {
@@ -135,8 +144,17 @@ runs:
               git rev-parse --verify --quiet "$sha~1^{commit}" *> $null
               if ($LASTEXITCODE -eq 0) { $from = "$sha~1" }
             }
+            if (-not $from) {
+              # Without a checkout every git call fails and `--all-lines` would scan an empty folder: green and wrong.
+              git rev-parse --verify --quiet "$sha^{commit}" *> $null
+              if ($LASTEXITCODE -ne 0) {
+                [Console]::Error.WriteLine("modern-tara: run actions/checkout before this action: commit $sha is not in the working directory $((Get-Location).Path)")
+                $host.SetShouldExit(2)
+                exit 2
+              }
+            }
             # A root commit: every tracked file is a changed file.
-            $scope = if ($from) { @('--range', "$from..$sha") } else { @('--all-lines') }
+            $scope = @(if ($from) { '--range', "$from..$sha" } else { '--all-lines' })
           }
         }
         $report = Join-Path $env:RUNNER_TEMP 'modern-tara.json'
@@ -149,8 +167,11 @@ runs:
         if ($env:MT_ALLOW_SKIPPED) { $extra += @('--allow-skipped', $env:MT_ALLOW_SKIPPED) }
         & $env:MT_EXE scan --repo . @scope --gate --json $report @extra 2> $summary
         $code = $LASTEXITCODE
-        $text = [string](Get-Content -LiteralPath $summary -Raw -Encoding utf8)
+        $text = Get-Content -LiteralPath $summary -Raw -Encoding utf8
+        if ($null -eq $text) { $text = '' }
         [Console]::Error.Write($text)
         Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value ("``````text`n" + $text.TrimEnd() + "`n``````")
         "report=$report" >> $env:GITHUB_OUTPUT
+        # GitHub runs `pwsh -command ". 'step.ps1'"`, where a dot-sourced `exit 2` ends the job with 1.
+        $host.SetShouldExit($code)
         exit $code

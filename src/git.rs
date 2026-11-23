@@ -69,8 +69,14 @@ impl Git {
             return Err(format!("not a revision: {rev}"));
         }
         let spec = format!("{rev}^{{commit}}");
-        let out = self.run(&["rev-parse", "--verify", "--quiet", "--end-of-options", &spec])?;
-        Ok(out.stdout_text().trim().to_string())
+        let out = self.cmd().args(["rev-parse", "--verify", "--quiet", "--end-of-options", &spec]).run()?;
+        if out.ok() {
+            return Ok(out.stdout_text().trim().to_string());
+        }
+        // `--quiet` leaves stderr empty, so the revision has to be named here.
+        let tail = out.tail(3);
+        let hint = if tail.contains("safe.directory") { " (owned by another user: pass --git-safe)" } else { "" };
+        Err(format!("not a commit in this clone: {rev} (shallow clone? use fetch-depth: 0){hint}"))
     }
 
     /// `git diff -U0` between `from` and `to` (`None` = work tree, `Some("")`
